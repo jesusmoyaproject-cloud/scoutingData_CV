@@ -1,0 +1,16 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+kpt_shape: [30, 3]
+flip_idx: [22, 23, 24, 25, 26, 27, 20, 21, 16, 17, 18, 19, 12, 13, 14, 15, 8, 9, 10, 11, 6, 7, 0, 1, 2, 3, 4, 5, 29, 28]
+
+nc: 1
+names: ['pitch']
+
+roboflow:
+  workspace: scouting
+  project: scoutingdatakeypoint
+  version: 6
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/scouting/scoutingdatakeypoint/dataset/6

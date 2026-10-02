@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  keypoint_service:
+    build:
+      context: ..
+      dockerfile: services/keypoint_service/Dockerfile
+    container_name: keypoint_service_v2
+    ports:
+      - "8001:8001"
+    volumes:
+      - ../model/openVino:/app/model/openVino
+    restart: unless-stopped
+
+  player_service:
+    build:
+      context: ..
+      dockerfile: services/player_service/Dockerfile
+    container_name: player_service_v2
+    ports:
+      - "8002:8002"
+    volumes:
+      - ../model/openVino:/app/model/openVino
+    restart: unless-stopped
+
+  ball_service:
+    build:
+      context: ..
+      dockerfile: services/ball_service/Dockerfile
+    container_name: ball_service_v2
+    ports:
+      - "8003:8003"
+    volumes:
+      - ../model/openVino:/app/model/openVino
+    restart: unless-stopped
+
+  event_service:
+    build:
+      context: ..
+      dockerfile: services/event_service/Dockerfile
+    container_name: event_service_v2
+    ports:
+      - "8004:8004"
+    restart: unless-stopped
+
