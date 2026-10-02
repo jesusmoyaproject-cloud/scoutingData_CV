@@ -41,7 +41,7 @@ def run_kaggle_pipeline(video_path: str, output_path: str, csv_path: str, max_fr
     
     try:
         # 2. Dar tiempo para que levanten y verificar health checks
-        time.sleep(6)
+        time.sleep(20)
         
         # 3. Ejecutar main.py
         main_script = APP_DIR / "main.py"
