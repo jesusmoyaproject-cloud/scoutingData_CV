@@ -1,3 +1,12 @@
+"""
+ScoutingData v5.0 - Lanzador de Microservicios SOA (modo legacy / distribuido)
+
+En v5.0 el modo por defecto es inferencia directa (sin HTTP).
+Este script se usa solo si se quiere mantener la arquitectura SOA original
+para despliegue distribuido o debugging por servicio.
+Solo levanta 3 servicios (sin event_service).
+"""
+
 import os
 import sys
 import time
@@ -17,89 +26,73 @@ from config import settings
 
 SERVICES = [
     ("keypoint_service", 8001, "services.keypoint_service.main:app"),
-    ("player_service", 8002, "services.player_service.main:app"),
-    ("ball_service", 8003, "services.ball_service.main:app"),
-    ("event_service", 8004, "services.event_service.main:app"),
+    ("player_service",   8002, "services.player_service.main:app"),
+    ("ball_service",     8003, "services.ball_service.main:app"),
+    # event_service eliminado en v5.0
 ]
 
 def kill_port_owner(port: int):
-    """
-    Liberación portátil de puertos compatible con Windows y Linux (Kaggle).
-    """
     if sys.platform == "win32":
         try:
-            cmd = f'netstat -ano | findstr :{port}'
-            output = subprocess.check_output(cmd, shell=True).decode()
-            for line in output.splitlines():
-                if 'LISTENING' in line:
+            out = subprocess.check_output(f"netstat -ano | findstr :{port}", shell=True).decode()
+            for line in out.splitlines():
+                if "LISTENING" in line:
                     pid = line.strip().split()[-1]
-                    logger.info(f"Limpiando puerto {port} (proceso PID {pid})...")
-                    subprocess.run(f'taskkill /F /PID {pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(f"taskkill /F /PID {pid}", shell=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
     else:
         try:
-            subprocess.run(f"fuser -k {port}/tcp", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(f"fuser -k {port}/tcp", shell=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
 
-def check_service_health(name: str, port: int, max_retries: int = 20):
+def check_service_health(name: str, port: int, max_retries: int = 20) -> bool:
     url = f"http://127.0.0.1:{port}/health"
-    for attempt in range(1, max_retries + 1):
+    for _ in range(max_retries):
         try:
             r = httpx.get(url, timeout=3.0)
             if r.status_code == 200:
-                data = r.json()
-                logger.info(f"✅ {name} (Puerto {port}): OK -> {data.get('service')}")
+                logger.info(f"✅ {name} (:{port}) OK → {r.json().get('service')}")
                 return True
         except Exception:
             pass
         time.sleep(1)
-    logger.error(f"❌ {name} (Puerto {port}): No respondió tras {max_retries}s")
+    logger.error(f"❌ {name} (:{port}) no respondió.")
     return False
 
 def main():
-    logger.info(f"=== INICIANDO MICROSERVICIOS SOA (Entorno: {settings.ENVIRONMENT}) ===")
-    
-    # 1. Liberar puertos
+    logger.info(f"=== MICROSERVICIOS SOA v5.0 (Entorno: {settings.ENVIRONMENT}) ===")
+    logger.info("⚠️  Modo legacy: en v5.0 la inferencia directa no requiere estos servicios.")
+
     for _, port, _ in SERVICES:
         kill_port_owner(port)
-
     time.sleep(1)
-    processes = []
 
-    # 2. Iniciar servicios
+    processes = []
     for name, port, app_str in SERVICES:
-        cmd = [sys.executable, "-m", "uvicorn", app_str, "--host", "127.0.0.1", "--port", str(port)]
+        cmd = [sys.executable, "-m", "uvicorn", app_str,
+               "--host", "127.0.0.1", "--port", str(port)]
         logger.info(f"Iniciando {name} en http://127.0.0.1:{port} ...")
         proc = subprocess.Popen(cmd, cwd=str(APP_DIR))
         processes.append((name, port, proc))
 
-    # 3. Validar Health Checks con Retry Loop mientras cargan modelos OpenVINO
-    logger.info("Esperando inicialización de modelos OpenVINO en memoria...")
-    all_ok = True
-    for name, port, _ in processes:
-        ok = check_service_health(name, port, max_retries=20)
-        if not ok:
-            all_ok = False
-
-    logger.info("=======================================================")
-    if all_ok:
-        logger.info("¡Los 4 microservicios (Keypoint, Player, Ball, Event) están 100% activos!")
-    else:
-        logger.warning("Algunos servicios tardaron en responder. Revisa los logs arriba.")
-
-    logger.info("Presiona Ctrl + C en esta terminal para detenerlos.")
-    logger.info("=======================================================")
+    all_ok = all(check_service_health(n, p) for n, p, _ in processes)
+    logger.info("=" * 55)
+    logger.info("3 microservicios OK" if all_ok else "Algunos servicios fallaron.")
+    logger.info("Ctrl+C para detener.")
+    logger.info("=" * 55)
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("\nDeteniendo todos los microservicios...")
+        logger.info("\nDeteniendo servicios...")
         for name, port, proc in processes:
             proc.terminate()
-            logger.info(f"{name} (Puerto {port}) detenido.")
+            logger.info(f"  {name} (:{port}) detenido.")
         sys.exit(0)
 
 if __name__ == "__main__":
