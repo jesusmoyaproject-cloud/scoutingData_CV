@@ -102,10 +102,18 @@ def draw_calibration_overlay(
     conf_threshold: float = 0.5,
 ) -> np.ndarray:
     """Dibuja keypoints detectados. OPT-6: in-place."""
-    if result.keypoints is None:
+    if (
+        result is None
+        or result.keypoints is None
+        or len(result.keypoints) == 0
+        or result.keypoints.xy is None
+        or len(result.keypoints.xy) == 0
+    ):
         return img
     kps_xy   = result.keypoints.xy[0].cpu().numpy()
     kps_conf = result.keypoints.conf[0].cpu().numpy()
+    if len(kps_xy) == 0:
+        return img
     used = 0
     for idx, (xy, conf) in enumerate(zip(kps_xy, kps_conf)):
         if conf < conf_threshold:

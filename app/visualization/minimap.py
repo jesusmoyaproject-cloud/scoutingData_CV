@@ -62,7 +62,13 @@ def draw_minimap_with_projections(
 
     # Puntos GT detectados
     detected_labels = set()
-    if result.keypoints is not None:
+    if (
+        result is not None
+        and result.keypoints is not None
+        and len(result.keypoints) > 0
+        and result.keypoints.conf is not None
+        and len(result.keypoints.conf) > 0
+    ):
         kps_conf = result.keypoints.conf[0].cpu().numpy()
         for idx, conf in enumerate(kps_conf):
             if conf >= conf_threshold and idx in KP_MAP:
@@ -76,11 +82,19 @@ def draw_minimap_with_projections(
         else:
             cv2.circle(minimap_img, gt_px, 4, (255,100,0), -1, cv2.LINE_AA)
 
-    if result.keypoints is None:
+    if (
+        result is None
+        or result.keypoints is None
+        or len(result.keypoints) == 0
+        or result.keypoints.xy is None
+        or len(result.keypoints.xy) == 0
+    ):
         return minimap_img
 
     kps_xy   = result.keypoints.xy[0].cpu().numpy()
     kps_conf = result.keypoints.conf[0].cpu().numpy()
+    if len(kps_xy) == 0:
+        return minimap_img
     used = 0
     for idx, (xy, conf) in enumerate(zip(kps_xy, kps_conf)):
         if conf < conf_threshold:

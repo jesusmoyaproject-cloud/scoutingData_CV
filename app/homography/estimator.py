@@ -1,38 +1,35 @@
+"""
+ScoutingData v5.0 - Estimador de Homografía (Robustecido)
+"""
 import logging
-from typing import Dict, Tuple, Optional
 import cv2
 import numpy as np
-from homography.mappings import KP_MAP
+from typing import Tuple
+from config.field_dimensions import FieldDimensions
 from config.field_points import FIELD_COORDS
+from homography.mappings import KP_MAP
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("homography.estimator")
 
 def compute_homography(
-    result, 
-    conf_threshold: float = 0.5, 
+    result,
+    conf_threshold: float = 0.5,
     ransac_threshold: float = 5.0
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
-    """
-    Computes camera homography using detected keypoints and their real field coordinates.
-    
-    Args:
-        result: Ultralytics YOLO inference result object for a single frame.
-        conf_threshold: Threshold to ignore keypoints with low detection confidence.
-        ransac_threshold: RANSAC threshold parameter (in meters) for cv2.findHomography.
-        
-    Returns:
-        H: The 3x3 homography transformation matrix.
-        image_pts: Numpy array (N, 2) of source image coordinates (pixels).
-        field_pts: Numpy array (N, 2) of target field coordinates (meters).
-        mask: Mask array representing inliers/outliers.
-        inliers_count: Total inlier points.
-        outliers_count: Total outlier points.
-    """
-    if result.keypoints is None:
+    if (
+        result is None
+        or result.keypoints is None
+        or len(result.keypoints) == 0
+        or result.keypoints.xy is None
+        or len(result.keypoints.xy) == 0
+    ):
         raise ValueError("YOLO keypoints data is empty/None.")
 
     kps_xy = result.keypoints.xy[0].cpu().numpy()
     kps_conf = result.keypoints.conf[0].cpu().numpy()
+
+    if len(kps_xy) == 0:
+        raise ValueError("YOLO keypoints array is empty.")
 
     image_pts_list = []
     field_pts_list = []
@@ -40,10 +37,8 @@ def compute_homography(
     for idx, (xy, conf) in enumerate(zip(kps_xy, kps_conf)):
         if conf < conf_threshold:
             continue
-
         if idx not in KP_MAP:
             continue
-
         label = KP_MAP[idx]
         if label not in FIELD_COORDS:
             continue
@@ -55,9 +50,7 @@ def compute_homography(
     field_pts = np.array(field_pts_list, dtype=np.float32)
 
     if len(image_pts) < 4:
-        raise ValueError(
-            f"At least 4 keypoints are required to compute homography. Found: {len(image_pts)}"
-        )
+        raise ValueError(f"At least 4 keypoints required to compute homography. Found: {len(image_pts)}")
 
     H, mask = cv2.findHomography(
         image_pts,
