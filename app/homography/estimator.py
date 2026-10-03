@@ -8,6 +8,7 @@ from typing import Tuple
 from config.field_dimensions import FieldDimensions
 from config.field_points import FIELD_COORDS
 from homography.mappings import KP_MAP
+from homography.validation import validate_homography_matrix
 
 logger = logging.getLogger("homography.estimator")
 
@@ -59,8 +60,8 @@ def compute_homography(
         ransac_threshold
     )
 
-    if H is None:
-        raise ValueError("Homography calculation failed (returned None).")
+    if H is None or not validate_homography_matrix(H):
+        raise ValueError("Homography calculation failed (returned None or invalid matrix).")
 
     inliers_count = int(mask.sum())
     outliers_count = len(mask) - inliers_count

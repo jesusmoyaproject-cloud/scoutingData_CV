@@ -117,8 +117,8 @@ BALL_SERVICE_URL     = os.getenv("BALL_SERVICE_URL",     "http://127.0.0.1:8003"
 
 # ─── Umbrales y Parámetros ───────────────────────────────────────────────────
 CONF_KEYPOINT       = float(os.getenv("CONF_KEYPOINT",       "0.25"))
-CONF_PLAYER         = float(os.getenv("CONF_PLAYER",         "0.35"))
-CONF_BALL           = float(os.getenv("CONF_BALL",           "0.15"))
+CONF_PLAYER         = float(os.getenv("CONF_PLAYER",         "0.70"))
+CONF_BALL           = float(os.getenv("CONF_BALL",           "0.35"))
 RANSAC_THRESHOLD    = float(os.getenv("RANSAC_THRESHOLD",    "5.0"))
 MINIMAP_SCALE       = float(os.getenv("MINIMAP_SCALE",       "8.0"))
 HOMOGRAPHY_INTERVAL = int(os.getenv("HOMOGRAPHY_INTERVAL",   "1"))   # 1=cada frame, N>1=cada N frames

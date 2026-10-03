@@ -2,7 +2,7 @@ from typing import List, Tuple, Optional, Dict
 import numpy as np
 
 class BallTracker:
-    def __init__(self, max_history: int = 10, max_missing_frames: int = 5, max_distance_jump: float = 200.0):
+    def __init__(self, max_history: int = 10, max_missing_frames: int = 5, max_distance_jump: float = 180.0):
         self.max_history = max_history
         self.max_missing_frames = max_missing_frames
         self.max_distance_jump = max_distance_jump
@@ -15,13 +15,17 @@ class BallTracker:
             curr_x = current_detection["pixel_x"]
             curr_y = current_detection["pixel_y"]
 
-            if self.last_known_detection is not None and self.missing_count == 0:
+            # Descartar saltos bruscos irrazonables (falsos positivos lejanos)
+            if self.last_known_detection is not None and self.missing_count < 3:
                 prev_x = self.last_known_detection["pixel_x"]
                 prev_y = self.last_known_detection["pixel_y"]
                 dist = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
                 if dist > self.max_distance_jump:
-                    current_detection["confidence"] *= 0.7
+                    current_detection = None
 
+        if current_detection is not None:
+            curr_x = current_detection["pixel_x"]
+            curr_y = current_detection["pixel_y"]
             self.missing_count = 0
             self.last_known_detection = current_detection.copy()
             self.history.append((curr_x, curr_y))
@@ -55,3 +59,4 @@ class BallTracker:
                 return interpolated_det, [p for p in self.history if p is not None]
 
         return None, [p for p in self.history if p is not None]
+

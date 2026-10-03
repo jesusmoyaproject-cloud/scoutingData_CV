@@ -33,6 +33,7 @@ from config.field_dimensions import FieldDimensions
 from engine.direct_inference import DirectInferenceEngine
 from engine.async_writer import AsyncVideoWriter
 from homography.estimator import compute_homography
+from homography.validation import is_homography_transition_valid, smooth_homography
 from homography.transforms import pixel_to_field
 from sports.ball_tracker import BallTracker
 from visualization.pitch import draw_pitch_template
@@ -148,19 +149,25 @@ class SoccerAnalysisV5:
             ball_detection = raw_ball_det
             ball_history = [(raw_ball_det["pixel_x"], raw_ball_det["pixel_y"])] if raw_ball_det else []
 
-        # ── 3. Homografía (OPT-7: caché cada N frames) ───────────────────────
+        # ── 3. Homografía (OPT-7: caché cada N frames con filtro de continuidad) ──
         recalc = (frame_idx % self.homography_interval == 0) or (self._cached_H is None)
         if recalc:
             try:
-                H, _, _, mask, _, _ = compute_homography(
+                H_cand, _, _, mask, _, _ = compute_homography(
                     kp_result,
                     conf_threshold=self.conf_keypoint,
                     ransac_threshold=self.ransac_threshold,
                 )
-                self._cached_H    = H
-                self._cached_mask = mask
+                h_img, w_img = frame_bgr.shape[:2]
+                if is_homography_transition_valid(H_cand, self._cached_H, img_width=w_img, img_height=h_img, max_shift_m=15.0):
+                    H_smoothed = smooth_homography(H_cand, self._cached_H, alpha=0.35)
+                    self._cached_H    = H_smoothed
+                    self._cached_mask = mask
+                elif self._cached_H is None:
+                    self._cached_H    = H_cand
+                    self._cached_mask = mask
             except Exception:
-                pass  # Mantener caché anterior si falla
+                pass  # Mantener caché anterior si la nueva homografía falla o es rechazada por salto abrupto
 
         H    = self._cached_H
         mask = self._cached_mask
