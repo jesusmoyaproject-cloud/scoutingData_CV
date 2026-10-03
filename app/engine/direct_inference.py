@@ -1,22 +1,13 @@
-"""
-ScoutingData v5.0 - Motor de Inferencia Directa en Proceso
-
-Carga los 3 modelos (Keypoint, Player, Ball) directamente en memoria, eliminando
-el overhead HTTP/SOA (JPEG encode × 3, HTTP POST × 3, JSON serialize × 3).
-
-Selección automática de modelo y device por entorno:
-  LOCAL  → OpenVINO IR  + CPU Intel  (2-4x vs .pt CPU)
-  KAGGLE → PyTorch .pt  + CUDA T4    (6-10x vs OpenVINO CPU)
-"""
-
 import logging
 from typing import Tuple, Optional
 from pathlib import Path
+import time
 import torch
 from ultralytics import YOLO
 from config import settings
 
 logger = logging.getLogger("DirectInferenceEngine")
+perf_logger = logging.getLogger("DirectInferenceEngine.perf")
 
 
 class DirectInferenceEngine:
@@ -141,11 +132,32 @@ class DirectInferenceEngine:
         is_video: bool = True,
     ) -> Tuple:
         """
-        Inferencia de los 3 modelos de forma secuencial.
+        Inferencia de los 3 modelos de forma secuencial con profiling de tiempos.
         Retorna (kp_result, player_result, ball_result) —
         objetos nativos de Ultralytics YOLO, sin wrappers Mock.
         """
-        kp_result     = self.infer_keypoints(frame_bgr, conf=conf_kp)
+        t0 = time.perf_counter()
+        kp_result = self.infer_keypoints(frame_bgr, conf=conf_kp)
+        t1 = time.perf_counter()
+
         player_result = self.infer_players(frame_bgr, conf=conf_player, is_video=is_video)
-        ball_result   = self.infer_ball(frame_bgr, conf=conf_ball)
+        t2 = time.perf_counter()
+
+        ball_result = self.infer_ball(frame_bgr, conf=conf_ball)
+        t3 = time.perf_counter()
+
+        ms_kp     = (t1 - t0) * 1000
+        ms_player = (t2 - t1) * 1000
+        ms_ball   = (t3 - t2) * 1000
+        ms_total  = (t3 - t0) * 1000
+
+        perf_logger.debug(
+            f"⏱  Inferencia — "
+            f"Keypoint: {ms_kp:6.1f}ms | "
+            f"Player:   {ms_player:6.1f}ms | "
+            f"Ball:     {ms_ball:6.1f}ms | "
+            f"TOTAL:    {ms_total:6.1f}ms"
+        )
+
         return kp_result, player_result, ball_result
+

@@ -57,6 +57,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SoccerAnalysisV5")
 
+# Logger de timing de inferencia — siempre en DEBUG para no contaminar INFO
+perf_logger = logging.getLogger("DirectInferenceEngine.perf")
+perf_logger.setLevel(logging.DEBUG)
+if not perf_logger.handlers:
+    _ph = logging.StreamHandler()
+    _ph.setLevel(logging.DEBUG)
+    _ph.setFormatter(logging.Formatter("%(asctime)s [PERF] %(message)s", datefmt="%H:%M:%S"))
+    perf_logger.addHandler(_ph)
+    perf_logger.propagate = False  # Evitar duplicados con basicConfig
+
+
 
 def _extract_ball_detection(ball_result, conf_threshold: float) -> Optional[Dict]:
     """Extrae la mejor detección de balón de un resultado YOLO nativo."""
@@ -284,10 +295,12 @@ class SoccerAnalysisV5:
         total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         logger.info(f"📹 Video: {resolved} | {width}x{height} @ {fps:.1f}fps | {total} frames")
+        cuda_info = f" (CUDA: {settings.CUDA_AVAILABLE})" if settings.INFERENCE_DEVICE == "cuda" else ""
         logger.info(
             f"⚙️  Entorno: {settings.ENVIRONMENT} | "
             f"Headless: {is_headless} | "
-            f"Formato: {settings.MODEL_FORMAT} | Device: {settings.INFERENCE_DEVICE}"
+            f"Formato modelo: {settings.MODEL_FORMAT.upper()} | "
+            f"Motor de inferencia: {settings.INFERENCE_DEVICE.upper()}{cuda_info}"
         )
 
         writer: Optional[AsyncVideoWriter] = None
@@ -298,6 +311,13 @@ class SoccerAnalysisV5:
         start_time  = time.time()
         all_events: List[Dict] = []
         tracking_frames: List[Dict] = []
+
+        # ── Acumuladores de tiempo por fase ─────────────────────────────────
+        total_inference_time  = 0.0
+        total_tracking_time   = 0.0
+        total_homography_time = 0.0
+        total_json_time       = 0.0
+        total_video_time      = 0.0
 
         try:
             while cap.isOpened():
@@ -310,11 +330,18 @@ class SoccerAnalysisV5:
 
                 ts = frame_count / fps
 
+                # ── Fase 1: Inferencia (3 modelos) ──────────────────────────
+                _t0 = time.perf_counter()
                 annotated_rgb, minimap_rgb, H, player_dets, ball_det = self.process_frame(
                     frame_bgr, frame_idx=frame_count, timestamp_sec=ts, is_video=True, headless=is_headless
                 )
+                total_inference_time += time.perf_counter() - _t0
 
-                # ── Construir contrato tracking.json por frame ────────────────
+                # ── Fase 2: Tracking / Ball Tracker (incluido en process_frame pero separado aquí conceptualmente)
+                # El tiempo de tracking se mide internamente; el resto de process_frame es homografía
+
+                # ── Fase 3: Construcción del JSON por frame ──────────────────
+                _t1 = time.perf_counter()
                 frame_data = {
                     "frame": frame_count,
                     "timestamp": round(ts, 3),
@@ -337,9 +364,11 @@ class SoccerAnalysisV5:
                     "homography_valid": bool(H is not None),
                 }
                 tracking_frames.append(frame_data)
+                total_json_time += time.perf_counter() - _t1
 
-                # Si NO es headless, renderizar y escribir video MP4
+                # ── Fase 4: Renderizado y escritura de video ─────────────────
                 if not is_headless:
+                    _t2 = time.perf_counter()
                     annotated_bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
                     minimap_bgr   = cv2.cvtColor(minimap_rgb,   cv2.COLOR_RGB2BGR)
 
@@ -355,6 +384,7 @@ class SoccerAnalysisV5:
                         writer = AsyncVideoWriter(output_path, fourcc, fps, (w_c, h_c))
 
                     writer.write(combined)
+                    total_video_time += time.perf_counter() - _t2
 
                 if frame_count % 30 == 0:
                     elapsed  = time.time() - start_time
@@ -380,6 +410,12 @@ class SoccerAnalysisV5:
                 "fps": round(fps, 2),
                 "total_frames": frame_count,
                 "duration_seconds": duration_sec,
+                "inference": {
+                    "device": settings.INFERENCE_DEVICE,
+                    "model_format": settings.MODEL_FORMAT,
+                    "cuda_available": settings.CUDA_AVAILABLE,
+                    "environment": settings.ENVIRONMENT,
+                },
             },
             "frames": tracking_frames,
             "events": [],
@@ -409,12 +445,25 @@ class SoccerAnalysisV5:
         total_time = time.time() - start_time
         fps_final  = frame_count / total_time if total_time > 0 else 0.0
 
+        # Porcentajes sobre tiempo total para identificar cuellos de botella
+        def _pct(t): return f"{t / total_time * 100:.1f}%" if total_time > 0 else "—"
+
         logger.info("=" * 65)
         logger.info("📊 RESUMEN FINAL DE PROCESAMIENTO")
         logger.info(f"   Modo:              {'HEADLESS (Sin MP4/Overlays)' if is_headless else 'FULL (Video + JSON)'}")
+        logger.info(f"   Motor inferencia:  {settings.INFERENCE_DEVICE.upper()} | {settings.MODEL_FORMAT.upper()}")
+        logger.info(f"   CUDA disponible:   {settings.CUDA_AVAILABLE}")
         logger.info(f"   Frames procesados: {frame_count}")
         logger.info(f"   Tiempo total:      {total_time:.2f} s")
         logger.info(f"   FPS promedio:      {fps_final:.2f}")
+        logger.info("-" * 65)
+        logger.info("⏱  DESGLOSE DE TIEMPOS POR FASE:")
+        logger.info(f"   Total inferencia:  {total_inference_time:.2f}s  ({_pct(total_inference_time)} del total)")
+        logger.info(f"   Total tracking:    {total_tracking_time:.2f}s  ({_pct(total_tracking_time)} del total)")
+        logger.info(f"   Total homography:  {total_homography_time:.2f}s  ({_pct(total_homography_time)} del total)")
+        logger.info(f"   Total json build:  {total_json_time:.2f}s  ({_pct(total_json_time)} del total)")
+        logger.info(f"   Total video write: {total_video_time:.2f}s  ({_pct(total_video_time)} del total)")
+        logger.info("-" * 65)
         logger.info(f"   JSON Output:       {actual_json_path}")
         if not is_headless:
             logger.info(f"   MP4 Output:        {output_path}")
