@@ -30,6 +30,14 @@ def detect_environment() -> str:
 
 ENVIRONMENT = detect_environment()
 
+def detect_headless_mode() -> bool:
+    env_val = os.getenv("HEADLESS_MODE")
+    if env_val is not None:
+        return env_val.lower() in ("true", "1", "yes")
+    return ENVIRONMENT == "KAGGLE"
+
+HEADLESS_MODE = detect_headless_mode()
+
 # ─── Sección 0: Formato e Dispositivo de Inferencia ─────────────────────────
 #
 #  LOCAL  → OpenVINO IR (.xml/.bin)  en CPU Intel  → 2-4x vs .pt CPU
@@ -100,6 +108,7 @@ def _resolve_default_input() -> str:
 DEFAULT_INPUT_VIDEO  = _resolve_default_input()
 DEFAULT_OUTPUT_VIDEO = str(OUTPUT_DIR / "scouting_output.mp4")
 DEFAULT_OUTPUT_CSV   = str(OUTPUT_DIR / "events_output.csv")
+DEFAULT_OUTPUT_JSON  = str(OUTPUT_DIR / f"tracking_{Path(DEFAULT_INPUT_VIDEO).stem}.json")
 
 # ─── Microservicios SOA (modo legacy) ────────────────────────────────────────
 KEYPOINT_SERVICE_URL = os.getenv("KEYPOINT_SERVICE_URL", "http://127.0.0.1:8001")
@@ -124,6 +133,7 @@ def resolve_video_source(source_input: str) -> Path:
 def get_summary() -> Dict[str, Any]:
     return {
         "ENVIRONMENT":      ENVIRONMENT,
+        "HEADLESS_MODE":    HEADLESS_MODE,
         "MODEL_FORMAT":     MODEL_FORMAT,
         "INFERENCE_DEVICE": INFERENCE_DEVICE,
         "CUDA_AVAILABLE":   CUDA_AVAILABLE,

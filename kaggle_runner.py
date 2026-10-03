@@ -25,9 +25,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("KaggleRunner")
 
 def run_pipeline(video_path: str, output_path: str, csv_path: str,
-                 max_frames: int = None):
+                 json_path: str = None, max_frames: int = None):
     logger.info("=" * 65)
-    logger.info("⚽ ScoutingData v5.0 — Kaggle GPU Runner (Direct Inference)")
+    logger.info("⚽ ScoutingData v5.0 — Kaggle GPU Runner (Direct Inference + Headless)")
     logger.info("=" * 65)
     for k, v in settings.get_summary().items():
         logger.info(f"  {k}: {v}")
@@ -40,7 +40,10 @@ def run_pipeline(video_path: str, output_path: str, csv_path: str,
         "--output", output_path,
         "--csv",    csv_path,
         "--env",    "KAGGLE",
+        "--headless",
     ]
+    if json_path:
+        cmd.extend(["--json", json_path])
     if max_frames:
         cmd.extend(["--max-frames", str(max_frames)])
 
@@ -48,7 +51,8 @@ def run_pipeline(video_path: str, output_path: str, csv_path: str,
     try:
         result = subprocess.run(cmd, check=True)
         if result.returncode == 0:
-            logger.info(f"✅ Completado. Video: {output_path} | CSV: {csv_path}")
+            actual_json = json_path or str(settings.OUTPUT_DIR / f"tracking_{Path(video_path).stem}.json")
+            logger.info(f"✅ Completado en modo Headless. Tracking JSON: {actual_json}")
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Error: {e}")
 
@@ -57,6 +61,7 @@ if __name__ == "__main__":
     parser.add_argument("--video",  "-v", default=settings.DEFAULT_INPUT_VIDEO)
     parser.add_argument("--output", "-o", default=settings.DEFAULT_OUTPUT_VIDEO)
     parser.add_argument("--csv",    "-c", default=settings.DEFAULT_OUTPUT_CSV)
+    parser.add_argument("--json",   "-j", default=None)
     parser.add_argument("--max-frames", "-m", type=int, default=None)
     args = parser.parse_args()
-    run_pipeline(args.video, args.output, args.csv, args.max_frames)
+    run_pipeline(args.video, args.output, args.csv, args.json, args.max_frames)

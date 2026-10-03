@@ -17,6 +17,7 @@ import sys
 import time
 import logging
 import asyncio
+import json
 import argparse
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -77,7 +78,7 @@ def _extract_ball_detection(ball_result, conf_threshold: float) -> Optional[Dict
 
 class SoccerAnalysisV5:
     """
-    Pipeline de análisis v5.0: Inferencia directa + renders cacheados.
+    Pipeline de análisis v5.0: Inferencia directa + renders cacheados / Modo Headless.
     Sin SoccerNet, sin HTTP SOA.
     """
 
@@ -90,6 +91,7 @@ class SoccerAnalysisV5:
         field_dims: FieldDimensions = FieldDimensions(),
         minimap_scale: float = settings.MINIMAP_SCALE,
         homography_interval: int = settings.HOMOGRAPHY_INTERVAL,
+        headless: Optional[bool] = None,
     ):
         self.conf_keypoint   = conf_keypoint
         self.conf_player     = conf_player
@@ -98,6 +100,7 @@ class SoccerAnalysisV5:
         self.field_dims      = field_dims
         self.minimap_scale   = minimap_scale
         self.homography_interval = homography_interval
+        self.headless        = headless if headless is not None else settings.HEADLESS_MODE
 
         # Motor de inferencia directa (sin HTTP)
         self.engine = DirectInferenceEngine()
@@ -123,7 +126,10 @@ class SoccerAnalysisV5:
         frame_idx: int = 0,
         timestamp_sec: float = 0.0,
         is_video: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], List[Dict], Optional[Dict]]:
+        headless: Optional[bool] = None,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], List[Dict], Optional[Dict]]:
+
+        is_headless = headless if headless is not None else self.headless
 
         # ── 1. Inferencia Directa ────────────────────────────────────────────
         kp_result, player_result, ball_result = self.engine.infer(
@@ -196,6 +202,10 @@ class SoccerAnalysisV5:
                     "pitch_y_m":   round(fy, 2) if fy is not None else None,
                 })
 
+        # Si estamos en modo headless, omitir renderizado OpenCV (Overlays, Minimap, cvtColor)
+        if is_headless:
+            return None, None, H, player_detections, ball_detection
+
         # ── 5. Render Camera Frame (OPT-6: in-place, sin copias extra) ──────
         annotated = frame_bgr.copy()   # Una sola copia al inicio
 
@@ -245,9 +255,13 @@ class SoccerAnalysisV5:
         video_path: str,
         output_path: str,
         csv_output_path: Optional[str] = None,
+        json_output_path: Optional[str] = None,
         max_frames: Optional[int] = None,
+        headless: Optional[bool] = None,
     ) -> List[Dict]:
         import csv
+
+        is_headless = headless if headless is not None else self.headless
 
         resolved = settings.resolve_video_source(video_path)
         if not resolved.exists():
@@ -263,14 +277,20 @@ class SoccerAnalysisV5:
         total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         logger.info(f"📹 Video: {resolved} | {width}x{height} @ {fps:.1f}fps | {total} frames")
-        logger.info(f"⚙️  Entorno: {settings.ENVIRONMENT} | Formato: {settings.MODEL_FORMAT} | Device: {settings.INFERENCE_DEVICE}")
+        logger.info(
+            f"⚙️  Entorno: {settings.ENVIRONMENT} | "
+            f"Headless: {is_headless} | "
+            f"Formato: {settings.MODEL_FORMAT} | Device: {settings.INFERENCE_DEVICE}"
+        )
 
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        writer: Optional[AsyncVideoWriter] = None   # OPT-8
+        writer: Optional[AsyncVideoWriter] = None
+        if not is_headless:
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         frame_count = 0
         start_time  = time.time()
         all_events: List[Dict] = []
+        tracking_frames: List[Dict] = []
 
         try:
             while cap.isOpened():
@@ -284,39 +304,86 @@ class SoccerAnalysisV5:
                 ts = frame_count / fps
 
                 annotated_rgb, minimap_rgb, H, player_dets, ball_det = self.process_frame(
-                    frame_bgr, frame_idx=frame_count, timestamp_sec=ts, is_video=True
+                    frame_bgr, frame_idx=frame_count, timestamp_sec=ts, is_video=True, headless=is_headless
                 )
 
-                annotated_bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
-                minimap_bgr   = cv2.cvtColor(minimap_rgb,   cv2.COLOR_RGB2BGR)
+                # ── Construir contrato tracking.json por frame ────────────────
+                frame_data = {
+                    "frame": frame_count,
+                    "timestamp": round(ts, 3),
+                    "players": [
+                        {
+                            "track_id": p["player_id"],
+                            "pixel_x": p["pixel_x"],
+                            "pixel_y": p["pixel_y"],
+                            "pitch_x": p["pitch_x_m"],
+                            "pitch_y": p["pitch_y_m"],
+                        }
+                        for p in player_dets
+                    ],
+                    "ball": {
+                        "pixel_x": ball_det["pixel_x"],
+                        "pixel_y": ball_det["pixel_y"],
+                        "pitch_x": ball_det["pitch_x_m"],
+                        "pitch_y": ball_det["pitch_y_m"],
+                    } if ball_det is not None else None,
+                    "homography_valid": bool(H is not None),
+                }
+                tracking_frames.append(frame_data)
 
-                h_f, w_f = annotated_bgr.shape[:2]
-                h_m, w_m = minimap_bgr.shape[:2]
-                scale_r   = h_f / float(h_m)
-                minimap_r = cv2.resize(minimap_bgr, (int(w_m * scale_r), h_f))
-                combined  = np.hstack([annotated_bgr, minimap_r])
+                # Si NO es headless, renderizar y escribir video MP4
+                if not is_headless:
+                    annotated_bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
+                    minimap_bgr   = cv2.cvtColor(minimap_rgb,   cv2.COLOR_RGB2BGR)
 
-                if writer is None:
-                    h_c, w_c = combined.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = AsyncVideoWriter(output_path, fourcc, fps, (w_c, h_c))
+                    h_f, w_f = annotated_bgr.shape[:2]
+                    h_m, w_m = minimap_bgr.shape[:2]
+                    scale_r   = h_f / float(h_m)
+                    minimap_r = cv2.resize(minimap_bgr, (int(w_m * scale_r), h_f))
+                    combined  = np.hstack([annotated_bgr, minimap_r])
 
-                writer.write(combined)   # OPT-8: no bloquea
+                    if writer is None:
+                        h_c, w_c = combined.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = AsyncVideoWriter(output_path, fourcc, fps, (w_c, h_c))
+
+                    writer.write(combined)
 
                 if frame_count % 30 == 0:
                     elapsed  = time.time() - start_time
                     fps_avg  = frame_count / elapsed
-                    pending  = writer.pending_frames if writer else 0
+                    buf_str  = f" | Buf escritura: {writer.pending_frames}" if (writer and not is_headless) else " (HEADLESS)"
                     logger.info(
                         f"Frame {frame_count}/{total} | "
-                        f"{fps_avg:.2f} FPS | "
-                        f"Buf escritura: {pending}"
+                        f"{fps_avg:.2f} FPS{buf_str}"
                     )
 
         finally:
             cap.release()
             if writer:
                 writer.release()
+
+        # ── Exportar JSON Contract ───────────────────────────────────────────
+        video_name = resolved.name
+        duration_sec = round(frame_count / fps, 2) if fps > 0 else 0.0
+
+        tracking_dataset = {
+            "metadata": {
+                "video_name": video_name,
+                "fps": round(fps, 2),
+                "total_frames": frame_count,
+                "duration_seconds": duration_sec,
+            },
+            "frames": tracking_frames,
+            "events": [],
+        }
+
+        actual_json_path = json_output_path or str(settings.OUTPUT_DIR / f"tracking_{resolved.stem}.json")
+        json_path_obj = Path(actual_json_path)
+        json_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        with open(json_path_obj, "w", encoding="utf-8") as f:
+            json.dump(tracking_dataset, f, indent=2)
+        logger.info(f"💾 Tracking JSON exportado: {actual_json_path}")
 
         # ── CSV Export ────────────────────────────────────────────────────────
         if csv_output_path and all_events:
@@ -333,11 +400,19 @@ class SoccerAnalysisV5:
             logger.info(f"📄 CSV exportado: {csv_output_path}")
 
         total_time = time.time() - start_time
-        logger.info(
-            f"✅ Procesamiento finalizado: {total_time:.2f}s | "
-            f"{frame_count / total_time:.2f} FPS promedio | "
-            f"Output: {output_path}"
-        )
+        fps_final  = frame_count / total_time if total_time > 0 else 0.0
+
+        logger.info("=" * 65)
+        logger.info("📊 RESUMEN FINAL DE PROCESAMIENTO")
+        logger.info(f"   Modo:              {'HEADLESS (Sin MP4/Overlays)' if is_headless else 'FULL (Video + JSON)'}")
+        logger.info(f"   Frames procesados: {frame_count}")
+        logger.info(f"   Tiempo total:      {total_time:.2f} s")
+        logger.info(f"   FPS promedio:      {fps_final:.2f}")
+        logger.info(f"   JSON Output:       {actual_json_path}")
+        if not is_headless:
+            logger.info(f"   MP4 Output:        {output_path}")
+        logger.info("=" * 65)
+
         return all_events
 
 
@@ -347,9 +422,11 @@ def main():
         description="ScoutingData v5.0 — Soccer Analysis Pipeline (Direct + OpenVINO/CUDA)"
     )
     parser.add_argument("--video",  "-v", default=settings.DEFAULT_INPUT_VIDEO, help="Video de entrada")
-    parser.add_argument("--output", "-o", default=settings.DEFAULT_OUTPUT_VIDEO, help="Video de salida")
+    parser.add_argument("--output", "-o", default=settings.DEFAULT_OUTPUT_VIDEO, help="Video de salida MP4")
     parser.add_argument("--csv",    "-c", default=settings.DEFAULT_OUTPUT_CSV,   help="CSV de eventos")
+    parser.add_argument("--json",   "-j", default=None,                          help="JSON de tracking output")
     parser.add_argument("--env",    "-e", choices=["LOCAL", "KAGGLE"],           help="Forzar entorno")
+    parser.add_argument("--headless", action="store_true", default=None,         help="Modo headless (Sin renderizar MP4/Overlays)")
     parser.add_argument("--max-frames", "-m", type=int, default=None,            help="Límite de frames")
     parser.add_argument("--homography-interval", type=int,
                         default=settings.HOMOGRAPHY_INTERVAL,
@@ -359,6 +436,9 @@ def main():
     if args.env:
         os.environ["ENVIRONMENT"] = args.env
 
+    if args.headless:
+        os.environ["HEADLESS_MODE"] = "True"
+
     logger.info("=" * 65)
     logger.info("  ScoutingData v5.0 — Direct Inference Pipeline")
     logger.info("=" * 65)
@@ -367,7 +447,8 @@ def main():
     logger.info("=" * 65)
 
     pipeline = SoccerAnalysisV5(
-        homography_interval=args.homography_interval
+        homography_interval=args.homography_interval,
+        headless=args.headless,
     )
 
     resolved = settings.resolve_video_source(args.video)
@@ -376,7 +457,9 @@ def main():
             video_path=str(resolved),
             output_path=args.output,
             csv_output_path=args.csv,
+            json_output_path=args.json,
             max_frames=args.max_frames,
+            headless=args.headless,
         )
     else:
         logger.warning(f"Video no encontrado: {resolved}")
