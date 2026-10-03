@@ -120,9 +120,11 @@ def draw_calibration_overlay(
             continue
         x, y = int(xy[0]), int(xy[1])
         label = KP_MAP.get(idx, "??")
-        if mask is not None:
+        if mask is not None and used < len(mask):
             color = (0, 255, 0) if bool(mask[used][0]) else (0, 0, 255)
             used += 1
+        elif mask is not None:
+            color = (0, 165, 255)  # Naranja = keypoint extra no indexado en mask
         else:
             color = (255, 0, 0)
         cv2.circle(img, (x, y), 8, color, -1)
