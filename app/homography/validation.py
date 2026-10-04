@@ -1,7 +1,10 @@
+import logging
 import cv2
 import numpy as np
 from typing import Tuple, Dict, Optional
 from homography.transforms import pixel_to_field
+
+_val_logger = logging.getLogger("Homography.debug")
 
 def evaluate_reprojection_error(
     H: np.ndarray, 
@@ -56,15 +59,16 @@ def is_homography_transition_valid(
     H_prev: Optional[np.ndarray],
     img_width: int = 1920,
     img_height: int = 1080,
-    max_shift_m: float = 15.0,
+    max_shift_m: float = 35.0,    # Ampliado: permite pans de cámara más largos
     pitch_width: float = 105.0,
     pitch_height: float = 68.0,
-    margin_m: float = 25.0
+    margin_m: float = 40.0        # Ampliado: evitar rechazos en bordes de cancha
 ) -> bool:
     """
     Valida que H_new no sufra saltos bruscos respecto a H_prev ni invierta el lado del campo.
     """
     if not validate_homography_matrix(H_new):
+        _val_logger.debug("  ✖ H_new falla validate_homography_matrix")
         return False
 
     # 1. Posición proyectada del centro de la imagen en el terreno
@@ -73,49 +77,67 @@ def is_homography_transition_valid(
 
     # Verificar que el centro de cámara proyectado caiga en un rango razonable del terreno
     if not (-margin_m <= fx_new <= pitch_width + margin_m and -margin_m <= fy_new <= pitch_height + margin_m):
+        _val_logger.debug(
+            f"  ✖ Proyección fuera del campo: fx={fx_new:.1f}m, fy={fy_new:.1f}m "
+            f"(límites: [-{margin_m}, {pitch_width + margin_m}] x [-{margin_m}, {pitch_height + margin_m}])"
+        )
         return False
 
-    # 2. Coherencia de orientación Horizontal (Evitar giros/inversiones Espejo Izquierda ↔ Derecha)
-    left_x, _ = pixel_to_field(0.0, cy, H_new)
+    # 2. Coherencia de orientación — solo rechazar si hay inversión Y además hay H_prev válida
+    left_x,  _ = pixel_to_field(0.0,            cy, H_new)
     right_x, _ = pixel_to_field(float(img_width), cy, H_new)
+    orient_new  = right_x - left_x
 
-    # En una toma normal de fútbol, conforme avanzamos a la derecha en la imagen (pixel X sube),
-    # las coordenadas de terreno también deben cambiar consistentemente en orientación.
-    # Si la orientación cambia bruscamente (ej. left_x > right_x cuando antes era left_x < right_x), rechazar.
     if H_prev is not None and validate_homography_matrix(H_prev):
-        prev_left_x, _ = pixel_to_field(0.0, cy, H_prev)
+        prev_left_x,  _ = pixel_to_field(0.0,            cy, H_prev)
         prev_right_x, _ = pixel_to_field(float(img_width), cy, H_prev)
-        
-        orient_new = right_x - left_x
         orient_prev = prev_right_x - prev_left_x
-        
-        if (orient_new * orient_prev) < 0:
-            # Inversión de orientación izquierda/derecha respecto al frame anterior
+
+        # Solo rechazar si el eje horizontal se invierte completamente
+        # Y el cambio de orientación es grande (evitar falsos positivos con pequeñas variaciones)
+        if (orient_new * orient_prev) < 0 and abs(orient_new - orient_prev) > 20.0:
+            _val_logger.debug(
+                f"  ✖ Inversión de orientación: orient_prev={orient_prev:.1f}m, orient_new={orient_new:.1f}m"
+            )
             return False
 
-        # 3. Control de Distancia Máxima entre frames (Rechazo de saltos bruscos)
+        # 3. Control de distancia máxima entre frames
         fx_prev, fy_prev = pixel_to_field(cx, cy, H_prev)
         shift_dist = np.sqrt((fx_new - fx_prev) ** 2 + (fy_new - fy_prev) ** 2)
+        _val_logger.debug(f"  ℹ Shift centro: {shift_dist:.1f}m (máx={max_shift_m}m)")
         if shift_dist > max_shift_m:
+            _val_logger.debug(f"  ✖ Salto demasiado brusco: {shift_dist:.1f}m > {max_shift_m}m")
             return False
 
     return True
 
+
 def smooth_homography(
     H_new: np.ndarray,
     H_prev: Optional[np.ndarray],
-    alpha: float = 0.3
+    alpha: float = 0.7
 ) -> np.ndarray:
     """
-    Aplica suavizado exponencial (EMA) a la matriz de homografía para eliminar micro-vibraciones.
+    Aplica suavizado exponencial (EMA) a la matriz de homografía.
+    alpha=0.7 → 70% H_new + 30% H_prev (responsivo pero estable).
+    Si la H resultante del blend es degenerada, se retorna H_new directamente.
     """
     if H_prev is None or not validate_homography_matrix(H_prev):
         return H_new
 
-    # Normalizar ambas matrices por H[2,2] para que sean comparables
-    H_n = H_new / (H_new[2, 2] if H_new[2, 2] != 0 else 1.0)
-    H_p = H_prev / (H_prev[2, 2] if H_prev[2, 2] != 0 else 1.0)
+    # Normalizar ambas matrices por H[2,2] para evitar drift numérico entre frames
+    h22_new  = H_new[2, 2]  if H_new[2, 2]  != 0 else 1.0
+    h22_prev = H_prev[2, 2] if H_prev[2, 2] != 0 else 1.0
+    H_n = H_new  / h22_new
+    H_p = H_prev / h22_prev
 
     H_smoothed = alpha * H_n + (1.0 - alpha) * H_p
+
+    # Si el blend produce una H degenerada, usar H_new directamente sin suavizar
+    if not validate_homography_matrix(H_smoothed):
+        _val_logger.debug("  ⚠ H_smoothed degenerada tras EMA — se usa H_new directa")
+        return H_new
+
     return H_smoothed
+
 

@@ -57,15 +57,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SoccerAnalysisV5")
 
-# Logger de timing de inferencia — siempre en DEBUG para no contaminar INFO
+# Logger de timing de inferencia — desactivado por defecto, se activa con --debug-homography
 perf_logger = logging.getLogger("DirectInferenceEngine.perf")
-perf_logger.setLevel(logging.DEBUG)
-if not perf_logger.handlers:
-    _ph = logging.StreamHandler()
-    _ph.setLevel(logging.DEBUG)
-    _ph.setFormatter(logging.Formatter("%(asctime)s [PERF] %(message)s", datefmt="%H:%M:%S"))
-    perf_logger.addHandler(_ph)
-    perf_logger.propagate = False  # Evitar duplicados con basicConfig
+perf_logger.setLevel(logging.WARNING)  # Silencioso por defecto
+perf_logger.propagate = False
+
+# Logger de homografía — desactivado por defecto, se activa con --debug-homography
+homography_logger = logging.getLogger("Homography.debug")
+homography_logger.setLevel(logging.WARNING)  # Silencioso por defecto
+homography_logger.propagate = False
+
+def _enable_debug_mode():
+    """Activa logs detallados de homografía e inferencia (--debug-homography)."""
+    _fmt = logging.Formatter("%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
+    for lg in (perf_logger, homography_logger):
+        lg.setLevel(logging.DEBUG)
+        if not lg.handlers:
+            _h = logging.StreamHandler()
+            _h.setLevel(logging.DEBUG)
+            _h.setFormatter(_fmt)
+            lg.addHandler(_h)
 
 
 
@@ -131,6 +142,7 @@ class SoccerAnalysisV5:
         # Caché de homografía (OPT-7)
         self._cached_H:    Optional[np.ndarray] = None
         self._cached_mask: Optional[np.ndarray] = None
+        self._h_reject_streak: int = 0   # Contador de rechazos consecutivos para auto-reset
 
     def process_frame(
         self,
@@ -164,21 +176,55 @@ class SoccerAnalysisV5:
         recalc = (frame_idx % self.homography_interval == 0) or (self._cached_H is None)
         if recalc:
             try:
-                H_cand, _, _, mask, _, _ = compute_homography(
+                H_cand, _, _, mask, inliers, _ = compute_homography(
                     kp_result,
                     conf_threshold=self.conf_keypoint,
                     ransac_threshold=self.ransac_threshold,
                 )
                 h_img, w_img = frame_bgr.shape[:2]
-                if is_homography_transition_valid(H_cand, self._cached_H, img_width=w_img, img_height=h_img, max_shift_m=15.0):
-                    H_smoothed = smooth_homography(H_cand, self._cached_H, alpha=0.35)
+
+                # Auto-reset si llevamos demasiados rechazos consecutivos
+                # (indica que la caché actual está bloqueada en estado incorrecto)
+                if self._h_reject_streak >= 8:
+                    homography_logger.debug(
+                        f"[Frame {frame_idx}] 🔄 AUTO-RESET caché H tras {self._h_reject_streak} rechazos consecutivos"
+                    )
+                    self._cached_H = None
+                    self._cached_mask = None
+                    self._h_reject_streak = 0
+
+                if is_homography_transition_valid(
+                    H_cand, self._cached_H,
+                    img_width=w_img, img_height=h_img,
+                    max_shift_m=35.0,   # Aumentado: permite correcciones de cámara más amplias
+                ):
+                    # alpha=0.7 → 70% nueva H, 30% anterior (más responsivo)
+                    H_smoothed = smooth_homography(H_cand, self._cached_H, alpha=0.7)
                     self._cached_H    = H_smoothed
                     self._cached_mask = mask
+                    self._h_reject_streak = 0
+                    homography_logger.debug(
+                        f"[Frame {frame_idx}] ✅ H aceptada | inliers={inliers} | EMA α=0.7"
+                    )
                 elif self._cached_H is None:
+                    # Primera H: aceptar directamente sin suavizado
                     self._cached_H    = H_cand
                     self._cached_mask = mask
-            except Exception:
-                pass  # Mantener caché anterior si la nueva homografía falla o es rechazada por salto abrupto
+                    self._h_reject_streak = 0
+                    homography_logger.debug(
+                        f"[Frame {frame_idx}] ✅ H inicial aceptada | inliers={inliers}"
+                    )
+                else:
+                    self._h_reject_streak += 1
+                    homography_logger.debug(
+                        f"[Frame {frame_idx}] ⚠ H RECHAZADA (streak={self._h_reject_streak}) "
+                        f"| inliers={inliers} — se mantiene caché anterior"
+                    )
+            except Exception as exc:
+                self._h_reject_streak += 1
+                homography_logger.debug(
+                    f"[Frame {frame_idx}] ✖ compute_homography falló (streak={self._h_reject_streak}): {exc}"
+                )
 
         H    = self._cached_H
         mask = self._cached_mask
@@ -276,6 +322,7 @@ class SoccerAnalysisV5:
         json_output_path: Optional[str] = None,
         max_frames: Optional[int] = None,
         headless: Optional[bool] = None,
+        debug_homography: bool = False,
     ) -> List[Dict]:
         import csv
 
@@ -294,14 +341,14 @@ class SoccerAnalysisV5:
         fps    = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
         total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        logger.info(f"📹 Video: {resolved} | {width}x{height} @ {fps:.1f}fps | {total} frames")
         cuda_info = f" (CUDA: {settings.CUDA_AVAILABLE})" if settings.INFERENCE_DEVICE == "cuda" else ""
         logger.info(
-            f"⚙️  Entorno: {settings.ENVIRONMENT} | "
-            f"Headless: {is_headless} | "
-            f"Formato modelo: {settings.MODEL_FORMAT.upper()} | "
-            f"Motor de inferencia: {settings.INFERENCE_DEVICE.upper()}{cuda_info}"
+            f"📹 {resolved.name} | {width}x{height} @ {fps:.1f}fps | "
+            f"{total} frames | {settings.INFERENCE_DEVICE.upper()} {settings.MODEL_FORMAT.upper()}{cuda_info}"
         )
+        if debug_homography:
+            _enable_debug_mode()
+            logger.info("🔍 Modo DEBUG de homografía activado")
 
         writer: Optional[AsyncVideoWriter] = None
         if not is_headless:
@@ -387,18 +434,19 @@ class SoccerAnalysisV5:
                     total_video_time += time.perf_counter() - _t2
 
                 if frame_count % 30 == 0:
-                    elapsed  = time.time() - start_time
-                    fps_avg  = frame_count / elapsed
-                    buf_str  = f" | Buf escritura: {writer.pending_frames}" if (writer and not is_headless) else " (HEADLESS)"
-                    logger.info(
-                        f"Frame {frame_count}/{total} | "
-                        f"{fps_avg:.2f} FPS{buf_str}"
-                    )
+                    elapsed = time.time() - start_time
+                    fps_avg = frame_count / elapsed
+                    pct     = frame_count / total * 100 if total > 0 else 0
+                    bar_len = 30
+                    filled  = int(bar_len * frame_count / total) if total > 0 else 0
+                    bar     = "█" * filled + "░" * (bar_len - filled)
+                    print(f"\r  [{bar}] {pct:5.1f}%  {frame_count}/{total}  {fps_avg:.1f} FPS", end="", flush=True)
 
         finally:
             cap.release()
             if writer:
                 writer.release()
+            print()  # Salto de línea tras la barra de progreso
 
         # ── Exportar JSON Contract ───────────────────────────────────────────
         video_name = resolved.name
@@ -487,6 +535,8 @@ def main():
     parser.add_argument("--homography-interval", type=int,
                         default=settings.HOMOGRAPHY_INTERVAL,
                         help="Recalcular H cada N frames (1=cada frame, 5=cada 5 frames)")
+    parser.add_argument("--debug-homography", action="store_true", default=False,
+                        help="Activar logs detallados de homografía e inferencia por frame")
     args = parser.parse_args()
 
     if args.env:
@@ -516,6 +566,7 @@ def main():
             json_output_path=args.json,
             max_frames=args.max_frames,
             headless=args.headless,
+            debug_homography=args.debug_homography,
         )
     else:
         logger.warning(f"Video no encontrado: {resolved}")
