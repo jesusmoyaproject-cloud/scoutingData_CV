@@ -115,6 +115,7 @@ class SoccerAnalysisV5:
         minimap_scale: float = settings.MINIMAP_SCALE,
         homography_interval: int = settings.HOMOGRAPHY_INTERVAL,
         headless: Optional[bool] = None,
+        draw_outliers: Optional[bool] = None,
     ):
         self.conf_keypoint   = conf_keypoint
         self.conf_player     = conf_player
@@ -124,6 +125,7 @@ class SoccerAnalysisV5:
         self.minimap_scale   = minimap_scale
         self.homography_interval = homography_interval
         self.headless        = headless if headless is not None else settings.HEADLESS_MODE
+        self.draw_outliers   = draw_outliers if draw_outliers is not None else settings.DRAW_OUTLIERS
 
         # Motor de inferencia directa (sin HTTP)
         self.engine = DirectInferenceEngine()
@@ -280,8 +282,11 @@ class SoccerAnalysisV5:
                 precomputed_segments=self._pitch_field_segments,
                 color=(0, 255, 255), thickness=2,
             )
-            draw_calibration_overlay(annotated, kp_result, mask=mask,
-                                      conf_threshold=self.conf_keypoint)
+            draw_calibration_overlay(
+                annotated, kp_result, mask=mask,
+                conf_threshold=self.conf_keypoint,
+                draw_outliers=self.draw_outliers,
+            )
 
         draw_player_detections(annotated, player_result,
                                conf_threshold=self.conf_player,
@@ -342,13 +347,17 @@ class SoccerAnalysisV5:
         total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         cuda_info = f" (CUDA: {settings.CUDA_AVAILABLE})" if settings.INFERENCE_DEVICE == "cuda" else ""
+        # Frames efectivos a procesar (respetando max_frames)
+        effective_total = min(total, max_frames) if max_frames else total
+        limit_str = f" [límite: {max_frames}]" if max_frames else ""
         logger.info(
             f"📹 {resolved.name} | {width}x{height} @ {fps:.1f}fps | "
-            f"{total} frames | {settings.INFERENCE_DEVICE.upper()} {settings.MODEL_FORMAT.upper()}{cuda_info}"
+            f"{total} frames totales{limit_str} | {settings.INFERENCE_DEVICE.upper()} {settings.MODEL_FORMAT.upper()}{cuda_info}"
         )
         if debug_homography:
             _enable_debug_mode()
-            logger.info("🔍 Modo DEBUG de homografía activado")
+            self.draw_outliers = True
+            logger.info("🔍 Modo DEBUG de homografía activado (outliers visibles)")
 
         writer: Optional[AsyncVideoWriter] = None
         if not is_headless:
@@ -436,11 +445,11 @@ class SoccerAnalysisV5:
                 if frame_count % 30 == 0:
                     elapsed = time.time() - start_time
                     fps_avg = frame_count / elapsed
-                    pct     = frame_count / total * 100 if total > 0 else 0
+                    pct     = frame_count / effective_total * 100 if effective_total > 0 else 0
                     bar_len = 30
-                    filled  = int(bar_len * frame_count / total) if total > 0 else 0
+                    filled  = int(bar_len * frame_count / effective_total) if effective_total > 0 else 0
                     bar     = "█" * filled + "░" * (bar_len - filled)
-                    print(f"\r  [{bar}] {pct:5.1f}%  {frame_count}/{total}  {fps_avg:.1f} FPS", end="", flush=True)
+                    print(f"\r  [{bar}] {pct:5.1f}%  {frame_count}/{effective_total}  {fps_avg:.1f} FPS", end="", flush=True)
 
         finally:
             cap.release()

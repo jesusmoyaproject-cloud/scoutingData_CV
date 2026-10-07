@@ -9,6 +9,8 @@ import cv2
 import numpy as np
 from typing import Optional, List
 from homography.mappings import KP_MAP
+from homography.estimator import filter_keypoints_by_pitch_side
+from config.field_points import FIELD_COORDS
 from config.field_dimensions import FieldDimensions
 
 # ── OPT-4: Caché de puntos de campo ──────────────────────────────────────────
@@ -74,6 +76,76 @@ def get_pitch_field_points(dims: FieldDimensions = FieldDimensions()) -> List[np
     return segments
 
 
+def _project_segment_clipped(
+    pts_segment: np.ndarray,
+    H_inv: np.ndarray,
+    w_clip: float = 0.01,
+    max_coord: float = 50000.0,
+) -> List[np.ndarray]:
+    """
+    Proyecta un segmento de cancha aplicando clipping en el plano w > w_clip.
+    Evita que puntos detrás de la cámara (w <= 0) se inviertan y generen líneas cruzadas en pantalla.
+    """
+    pts = pts_segment.reshape(-1, 2)
+    N = len(pts)
+    if N < 2:
+        return []
+
+    homo = np.column_stack([pts, np.ones(N, dtype=np.float32)])
+    cam = homo @ H_inv.T
+
+    result_polylines: List[np.ndarray] = []
+    current_chain: List[np.ndarray] = []
+
+    for i in range(N - 1):
+        p1 = cam[i]
+        p2 = cam[i + 1]
+        w1, w2 = p1[2], p2[2]
+
+        if w1 > w_clip and w2 > w_clip:
+            xy1 = p1[:2] / w1
+            xy2 = p2[:2] / w2
+            if abs(xy1[0]) < max_coord and abs(xy1[1]) < max_coord and abs(xy2[0]) < max_coord and abs(xy2[1]) < max_coord:
+                if not current_chain:
+                    current_chain.append(xy1)
+                current_chain.append(xy2)
+            else:
+                if len(current_chain) >= 2:
+                    result_polylines.append(np.array(current_chain, dtype=np.int32).reshape(-1, 1, 2))
+                current_chain = []
+        elif w1 > w_clip and w2 <= w_clip:
+            t = (w_clip - w1) / (w2 - w1) if abs(w2 - w1) > 1e-6 else 0.5
+            p_cut = p1 + t * (p2 - p1)
+            xy1 = p1[:2] / w1
+            xy_cut = p_cut[:2] / w_clip
+            if abs(xy1[0]) < max_coord and abs(xy1[1]) < max_coord and abs(xy_cut[0]) < max_coord and abs(xy_cut[1]) < max_coord:
+                if not current_chain:
+                    current_chain.append(xy1)
+                current_chain.append(xy_cut)
+            if len(current_chain) >= 2:
+                result_polylines.append(np.array(current_chain, dtype=np.int32).reshape(-1, 1, 2))
+            current_chain = []
+        elif w1 <= w_clip and w2 > w_clip:
+            t = (w_clip - w1) / (w2 - w1) if abs(w2 - w1) > 1e-6 else 0.5
+            p_cut = p1 + t * (p2 - p1)
+            xy_cut = p_cut[:2] / w_clip
+            xy2 = p2[:2] / w2
+            if len(current_chain) >= 2:
+                result_polylines.append(np.array(current_chain, dtype=np.int32).reshape(-1, 1, 2))
+            current_chain = []
+            if abs(xy_cut[0]) < max_coord and abs(xy_cut[1]) < max_coord and abs(xy2[0]) < max_coord and abs(xy2[1]) < max_coord:
+                current_chain = [xy_cut, xy2]
+        else:
+            if len(current_chain) >= 2:
+                result_polylines.append(np.array(current_chain, dtype=np.int32).reshape(-1, 1, 2))
+            current_chain = []
+
+    if len(current_chain) >= 2:
+        result_polylines.append(np.array(current_chain, dtype=np.int32).reshape(-1, 1, 2))
+
+    return result_polylines
+
+
 def draw_pitch_lines_on_image(
     img: np.ndarray,
     H: np.ndarray,
@@ -81,17 +153,22 @@ def draw_pitch_lines_on_image(
     precomputed_segments: Optional[List[np.ndarray]] = None,
     color: tuple = (0, 255, 255),
     thickness: int = 2,
+    w_clip: float = 0.01,
 ) -> np.ndarray:
     """
     Proyecta líneas de la cancha sobre la imagen de cámara usando H_inv.
     OPT-4: Si se pasan `precomputed_segments`, evita recalcular la geometría.
     OPT-6: Opera in-place sobre `img` (sin crear una copia).
+    Incluye clipping en el plano w > w_clip para evitar artefactos que cruzan la pantalla.
     """
-    _, H_inv = cv2.invert(H)
+    ret, H_inv = cv2.invert(H)
+    if not ret or H_inv is None:
+        return img
     segs = precomputed_segments if precomputed_segments is not None else get_pitch_field_points(dims)
     for pts in segs:
-        projected = cv2.perspectiveTransform(pts, H_inv)
-        cv2.polylines(img, [projected.astype(np.int32)], False, color, thickness, cv2.LINE_AA)
+        polylines = _project_segment_clipped(pts, H_inv, w_clip=w_clip)
+        for poly in polylines:
+            cv2.polylines(img, [poly], False, color, thickness, cv2.LINE_AA)
     return img
 
 
@@ -100,8 +177,14 @@ def draw_calibration_overlay(
     result,
     mask: Optional[np.ndarray] = None,
     conf_threshold: float = 0.5,
+    draw_outliers: bool = False,
+    enable_side_filter: bool = True,
 ) -> np.ndarray:
-    """Dibuja keypoints detectados. OPT-6: in-place."""
+    """
+    Dibuja keypoints detectados (inliers en verde).
+    Si draw_outliers=False, los puntos descartados por RANSAC no se dibujan para un video limpio.
+    OPT-6: in-place.
+    """
     if (
         result is None
         or result.keypoints is None
@@ -114,19 +197,33 @@ def draw_calibration_overlay(
     kps_conf = result.keypoints.conf[0].cpu().numpy()
     if len(kps_xy) == 0:
         return img
-    used = 0
-    for idx, (xy, conf) in enumerate(zip(kps_xy, kps_conf)):
-        if conf < conf_threshold:
-            continue
-        x, y = int(xy[0]), int(xy[1])
-        label = KP_MAP.get(idx, "??")
+
+    if enable_side_filter:
+        valid_candidates, _, _ = filter_keypoints_by_pitch_side(
+            kps_xy, kps_conf, conf_threshold=conf_threshold
+        )
+    else:
+        valid_candidates = []
+        for idx, (xy, conf) in enumerate(zip(kps_xy, kps_conf)):
+            if conf < conf_threshold or idx not in KP_MAP:
+                continue
+            lbl = KP_MAP[idx]
+            if lbl not in FIELD_COORDS:
+                continue
+            valid_candidates.append((idx, xy, float(conf), lbl))
+
+    for used, (idx, xy, conf, label) in enumerate(valid_candidates):
+        is_inlier = True
         if mask is not None and used < len(mask):
-            color = (0, 255, 0) if bool(mask[used][0]) else (0, 0, 255)
-            used += 1
+            is_inlier = bool(mask[used][0])
         elif mask is not None:
-            color = (0, 165, 255)  # Naranja = keypoint extra no indexado en mask
-        else:
-            color = (255, 0, 0)
+            is_inlier = False
+
+        if not is_inlier and not draw_outliers:
+            continue
+
+        color = (0, 255, 0) if is_inlier else (0, 0, 255)
+        x, y = int(xy[0]), int(xy[1])
         cv2.circle(img, (x, y), 8, color, -1)
         cv2.circle(img, (x, y), 9, (255, 255, 255), 1)
         text = f"Y:{idx} R:{label} ({conf:.2f})"

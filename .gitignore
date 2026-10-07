@@ -1,0 +1,16 @@
+# Datos generados
+data/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Entornos virtuales
+venv*
+.venv/
+
+# Videos
+*.mp4
+*.avi
+*.mo*

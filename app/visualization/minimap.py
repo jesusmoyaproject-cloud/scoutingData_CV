@@ -10,6 +10,7 @@ from typing import Optional
 from config.field_dimensions import FieldDimensions
 from config.field_points import FIELD_COORDS
 from homography.mappings import KP_MAP
+from homography.estimator import filter_keypoints_by_pitch_side
 from homography.transforms import pixel_to_field
 from visualization.pitch import draw_pitch_template
 
@@ -95,24 +96,23 @@ def draw_minimap_with_projections(
     kps_conf = result.keypoints.conf[0].cpu().numpy()
     if len(kps_xy) == 0:
         return minimap_img
-    used = 0
-    for idx, (xy, conf) in enumerate(zip(kps_xy, kps_conf)):
-        if conf < conf_threshold:
+    valid_candidates, _, _ = filter_keypoints_by_pitch_side(
+        kps_xy, kps_conf, conf_threshold=conf_threshold
+    )
+    for used, (idx, xy, conf, label) in enumerate(valid_candidates):
+        is_inlier = True
+        if mask is not None and used < len(mask):
+            is_inlier = bool(mask[used][0])
+        elif mask is not None:
+            is_inlier = False
+
+        if not is_inlier:
             continue
-        label = KP_MAP.get(idx)
-        if label is None:
-            continue
+
         fx, fy = pixel_to_field(xy[0], xy[1], H)
         px_x, px_y = f2px(fx, fy)
-        if mask is not None and used < len(mask):
-            color = (0, 255, 0) if bool(mask[used][0]) else (255, 128, 0)
-            used += 1
-        elif mask is not None:
-            color = (0, 165, 255)  # Naranja = keypoint extra no indexado en mask
-        else:
-            color = (255, 128, 0)
         cv2.circle(minimap_img, (px_x, px_y), 9, (255,255,255), 1, cv2.LINE_AA)
-        cv2.circle(minimap_img, (px_x, px_y), 5, color, -1, cv2.LINE_AA)
+        cv2.circle(minimap_img, (px_x, px_y), 5, (0, 255, 0), -1, cv2.LINE_AA)
         cv2.putText(minimap_img, label, (px_x+10, px_y+4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1, cv2.LINE_AA)
     return minimap_img

@@ -19,3 +19,8 @@ KP_MAP: Dict[int, str] = {
     24: '29', 25: '30', 26: '31', 27: '32',
     28: '14', 29: '19'
 }
+
+# Particiones lógicas del campo de fútbol para coherencia espacial
+LEFT_KEYPOINTS = {"01", "02", "03", "04", "05", "06", "07", "08", "10", "11", "12", "13"}
+CENTER_KEYPOINTS = {"14", "15", "16", "17", "18", "19"}
+RIGHT_KEYPOINTS = {"20", "21", "22", "23", "25", "26", "27", "28", "29", "30", "31", "32"}
