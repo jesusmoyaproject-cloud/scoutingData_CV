@@ -43,10 +43,13 @@ def draw_minimap_with_projections(
     padding_meters: float = 5.0,
     mask: Optional[np.ndarray] = None,
     cached_template: Optional[np.ndarray] = None,   # OPT-5
+    field_coverage_ratio: Optional[float] = None,
+    hull_area_m2: Optional[float] = None,
 ) -> np.ndarray:
     """
     Genera el minimap proyectando los keypoints detectados.
     OPT-5: Si se proporciona cached_template, no re-renderiza la cancha.
+    Dibuja el polígono de Convex Hull del área de cobertura y el badge de field_coverage_ratio.
     """
     if cached_template is not None:
         minimap_img = cached_template.copy()
@@ -60,6 +63,30 @@ def draw_minimap_with_projections(
 
     def f2px(x_m, y_m):
         return (int(x_m * scale_factor) + pad_px, int(y_m * scale_factor) + pad_px)
+
+    # ── Badge de Cobertura en Minimap 2D ─────────────────────────────────────
+    if field_coverage_ratio is not None and field_coverage_ratio > 0:
+        pct_val = field_coverage_ratio * 100.0
+        pct_str = f"Field Coverage: {pct_val:.1f}%"
+        if hull_area_m2 is not None and hull_area_m2 > 0:
+            pct_str += f" ({int(round(hull_area_m2))} m2)"
+
+        (tw, th), _ = cv2.getTextSize(pct_str, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        bx, by = pad_px, 10
+        bw, bh = tw + 28, th + 14
+
+        hm, wm = minimap_img.shape[:2]
+        if by + bh < hm and bx + bw < wm:
+            sub = minimap_img[by:by+bh, bx:bx+bw]
+            bg = np.zeros_like(sub)
+            cv2.addWeighted(bg, 0.65, sub, 0.35, 0, sub)
+            minimap_img[by:by+bh, bx:bx+bw] = sub
+
+            dot_color = (0, 255, 128) if pct_val >= 10.0 else ((0, 220, 255) if pct_val >= 5.0 else (0, 100, 255))
+            cv2.rectangle(minimap_img, (bx, by), (bx+bw, by+bh), (60, 60, 60), 1, cv2.LINE_AA)
+            cv2.circle(minimap_img, (bx + 10, by + bh//2), 4, dot_color, -1, cv2.LINE_AA)
+            cv2.putText(minimap_img, pct_str, (bx + 20, by + bh - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
     # Puntos GT detectados
     detected_labels = set()
@@ -99,6 +126,7 @@ def draw_minimap_with_projections(
     valid_candidates, _, _ = filter_keypoints_by_pitch_side(
         kps_xy, kps_conf, conf_threshold=conf_threshold
     )
+    inlier_pts_px = []
     for used, (idx, xy, conf, label) in enumerate(valid_candidates):
         is_inlier = True
         if mask is not None and used < len(mask):
@@ -111,10 +139,20 @@ def draw_minimap_with_projections(
 
         fx, fy = pixel_to_field(xy[0], xy[1], H)
         px_x, px_y = f2px(fx, fy)
+        inlier_pts_px.append([px_x, px_y])
         cv2.circle(minimap_img, (px_x, px_y), 9, (255,255,255), 1, cv2.LINE_AA)
         cv2.circle(minimap_img, (px_x, px_y), 5, (0, 255, 0), -1, cv2.LINE_AA)
         cv2.putText(minimap_img, label, (px_x+10, px_y+4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1, cv2.LINE_AA)
+
+    # ── Sombreado de Polígono Convex Hull de Cobertura en Minimap ────────────
+    if len(inlier_pts_px) >= 3:
+        hull_pts = cv2.convexHull(np.array(inlier_pts_px, dtype=np.int32))
+        overlay = minimap_img.copy()
+        cv2.fillPoly(overlay, [hull_pts], (0, 220, 100))
+        cv2.addWeighted(overlay, 0.15, minimap_img, 0.85, 0, minimap_img)
+        cv2.polylines(minimap_img, [hull_pts], True, (0, 255, 128), 1, cv2.LINE_AA)
+
     return minimap_img
 
 

@@ -179,12 +179,43 @@ def draw_calibration_overlay(
     conf_threshold: float = 0.5,
     draw_outliers: bool = False,
     enable_side_filter: bool = True,
+    field_coverage_ratio: Optional[float] = None,
+    hull_area_m2: Optional[float] = None,
+    H: Optional[np.ndarray] = None,
+    draw_residuals: bool = False,
 ) -> np.ndarray:
     """
-    Dibuja keypoints detectados (inliers en verde).
-    Si draw_outliers=False, los puntos descartados por RANSAC no se dibujan para un video limpio.
+    Dibuja keypoints detectados e instrumentación de diagnóstico.
+    Si draw_residuals=True y se provee H:
+      - VERDE = keypoint detectado por YOLO (u, v)
+      - ROJO  = keypoint reproyectado desde terreno vía H^-1 (u', v')
+      - Línea residual amarilla con vector de error y etiqueta métrica (m y px).
     OPT-6: in-place.
     """
+    # ── Badge de Cobertura de Terreno (Field Coverage Ratio) ─────────────
+    if field_coverage_ratio is not None and field_coverage_ratio > 0:
+        pct_val = field_coverage_ratio * 100.0
+        pct_str = f"Field Coverage: {pct_val:.1f}%"
+        if hull_area_m2 is not None and hull_area_m2 > 0:
+            pct_str += f" ({int(round(hull_area_m2))} m2)"
+
+        (tw, th), _ = cv2.getTextSize(pct_str, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+        bx, by = 20, 20
+        bw, bh = tw + 32, th + 16
+
+        h_img, w_img = img.shape[:2]
+        if by + bh < h_img and bx + bw < w_img:
+            sub = img[by:by+bh, bx:bx+bw]
+            bg = np.zeros_like(sub)
+            cv2.addWeighted(bg, 0.65, sub, 0.35, 0, sub)
+            img[by:by+bh, bx:bx+bw] = sub
+
+            dot_color = (0, 255, 128) if pct_val >= 10.0 else ((0, 220, 255) if pct_val >= 5.0 else (0, 100, 255))
+            cv2.rectangle(img, (bx, by), (bx+bw, by+bh), (60, 60, 60), 1, cv2.LINE_AA)
+            cv2.circle(img, (bx + 12, by + bh//2), 4, dot_color, -1, cv2.LINE_AA)
+            cv2.putText(img, pct_str, (bx + 22, by + bh - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+
     if (
         result is None
         or result.keypoints is None
@@ -193,8 +224,10 @@ def draw_calibration_overlay(
         or len(result.keypoints.xy) == 0
     ):
         return img
-    kps_xy   = result.keypoints.xy[0].cpu().numpy()
-    kps_conf = result.keypoints.conf[0].cpu().numpy()
+    raw_xy = result.keypoints.xy[0]
+    kps_xy = raw_xy.cpu().numpy() if hasattr(raw_xy, "cpu") else np.asarray(raw_xy)
+    raw_conf = result.keypoints.conf[0]
+    kps_conf = raw_conf.cpu().numpy() if hasattr(raw_conf, "cpu") else np.asarray(raw_conf)
     if len(kps_xy) == 0:
         return img
 
@@ -212,6 +245,13 @@ def draw_calibration_overlay(
                 continue
             valid_candidates.append((idx, xy, float(conf), lbl))
 
+    H_inv = None
+    if draw_residuals and H is not None:
+        try:
+            H_inv = np.linalg.inv(H)
+        except Exception:
+            H_inv = None
+
     for used, (idx, xy, conf, label) in enumerate(valid_candidates):
         is_inlier = True
         if mask is not None and used < len(mask):
@@ -219,17 +259,77 @@ def draw_calibration_overlay(
         elif mask is not None:
             is_inlier = False
 
-        if not is_inlier and not draw_outliers:
+        if not is_inlier and not draw_outliers and not draw_residuals:
             continue
 
-        color = (0, 255, 0) if is_inlier else (0, 0, 255)
-        x, y = int(xy[0]), int(xy[1])
-        cv2.circle(img, (x, y), 8, color, -1)
-        cv2.circle(img, (x, y), 9, (255, 255, 255), 1)
-        text = f"Y:{idx} R:{label} ({conf:.2f})"
-        cv2.putText(img, text, (x+12, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 3, cv2.LINE_AA)
-        cv2.putText(img, text, (x+12, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
+        x_det, y_det = int(round(xy[0])), int(round(xy[1]))
+
+        if draw_residuals and H is not None and H_inv is not None:
+            # 1. Punto detectado por YOLO (VERDE)
+            cv2.circle(img, (x_det, y_det), 7, (0, 255, 0), -1, cv2.LINE_AA)
+            cv2.circle(img, (x_det, y_det), 8, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # 2. Punto teórico reproyectado desde terreno: field_point -> H^-1 -> image_point (ROJO)
+            fld_pt = np.array(FIELD_COORDS[label], dtype=np.float32).reshape(1, 1, 2)
+            proj_img = cv2.perspectiveTransform(fld_pt, H_inv)[0, 0]
+            x_rep, y_rep = int(round(proj_img[0])), int(round(proj_img[1]))
+            cv2.circle(img, (x_rep, y_rep), 7, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.circle(img, (x_rep, y_rep), 8, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # 3. Vector residual que conecta detectado con reproyectado
+            line_color = (0, 255, 255) if is_inlier else (0, 100, 255)
+            cv2.line(img, (x_det, y_det), (x_rep, y_rep), line_color, 2, cv2.LINE_AA)
+
+            # 4. Error euclídeo en metros de campo y en píxeles
+            proj_fld = cv2.perspectiveTransform(np.array(xy, dtype=np.float32).reshape(1, 1, 2), H)[0, 0]
+            err_m = float(np.linalg.norm(proj_fld - FIELD_COORDS[label]))
+            err_px = float(np.linalg.norm(proj_img - xy))
+
+            status_tag = "IN" if is_inlier else "OUT"
+            lbl_text = f"KP{label}: {err_m:.2f}m ({err_px:.0f}px) [{status_tag}]"
+            cv2.putText(img, lbl_text, (x_det + 10, y_det - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(img, lbl_text, (x_det + 10, y_det - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+        else:
+            color = (0, 255, 0) if is_inlier else (0, 0, 255)
+            cv2.circle(img, (x_det, y_det), 8, color, -1)
+            cv2.circle(img, (x_det, y_det), 9, (255, 255, 255), 1)
+            text = f"Y:{idx} R:{label} ({conf:.2f})"
+            cv2.putText(img, text, (x_det+12, y_det-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 3, cv2.LINE_AA)
+            cv2.putText(img, text, (x_det+12, y_det-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
+
     return img
+
+
+def draw_reprojection_residuals(
+    img: np.ndarray,
+    H: np.ndarray,
+    result,
+    mask: Optional[np.ndarray] = None,
+    conf_threshold: float = 0.35,
+    enable_side_filter: bool = True,
+    field_coverage_ratio: Optional[float] = None,
+    hull_area_m2: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Visualización dedicada de depuración:
+    VERDE = keypoint detectado por YOLO
+    ROJO  = keypoint reproyectado usando: field_point -> H^-1 -> image_point
+    Líneas de error residual entre cada par de puntos con métricas cuantitativas.
+    """
+    return draw_calibration_overlay(
+        img=img,
+        result=result,
+        mask=mask,
+        conf_threshold=conf_threshold,
+        draw_outliers=True,
+        enable_side_filter=enable_side_filter,
+        field_coverage_ratio=field_coverage_ratio,
+        hull_area_m2=hull_area_m2,
+        H=H,
+        draw_residuals=True,
+    )
 
 
 def draw_player_detections(

@@ -1,75 +1,94 @@
-# ScoutingData v4.0 ⚽📊
+# ScoutingData v5.0 ⚽📊
 
-Pipeline de Análisis Táctico y Tracking de Fútbol impulsado por **OpenVINO**, **Ultralytics YOLO**, **SoccerNet Event Detection** y una **Arquitectura Orientada a Servicios (SOA)** con **FastAPI**.
+Pipeline de Análisis Táctico, Detección e Inferencia Directa de Fútbol impulsado por **OpenVINO (CPU)**, **Ultralytics YOLO (CUDA/PyTorch)**, **Homografía Robusta (USAC_MAGSAC + Tracker Cinemático)** y **Arquitectura de Alto Rendimiento (Headless + Threaded I/O)**.
 
-Designed for seamless deployment on both **Local Workstations** (Windows/Linux) and **Kaggle GPU Environments (Tesla T4)**.
-
----
-
-## 🏗️ Arquitectura del Sistema
-
-El sistema utiliza un pipeline distribuido asíncrono con 4 microservicios FastAPI:
-
-1. **Keypoint Service (`:8001`)**: Detección de puntos clave de calibración del terreno de juego para cálculo de homografía ($3D \to 2D$).
-2. **Player Service (`:8002`)**: Detección y seguimiento multilocal (*ByteTrack*) de jugadores y árbitros.
-3. **Ball Service (`:8003`)**: Detección y filtrado espacial del balón.
-4. **Event Service (`:8004`)**: Clasificación temporal de eventos futbolísticos (Pases, Remates, Faltas, Tarjetas, Goles) con atribución de emisor y receptor del pase.
-
-```
-                  ┌────────────────────────────────────────┐
-                  │          app/main.py Orquestador       │
-                  └──────────────────┬─────────────────────┘
-                                     │ Async HTTP Keep-Alive
-         ┌──────────────────┬────────┴─────────┬──────────────────┐
-         ▼                  ▼                  ▼                  ▼
-┌──────────────────┐┌──────────────────┐┌──────────────────┐┌──────────────────┐
-│ Keypoint Service ││  Player Service  ││   Ball Service   ││  Event Service   │
-│   (Port 8001)    ││   (Port 8002)    ││   (Port 8003)    ││   (Port 8004)    │
-└──────────────────┘└──────────────────┘└──────────────────┘└──────────────────┘
-```
+Diseñado para despliegue tanto en **Estaciones Locales de Trabajo** (Windows/Linux con CPU Intel) como en **Entornos Cloud/GPU (Kaggle Tesla T4)**.
 
 ---
 
-## 📁 Estructura del Proyecto v4.0
+## 🏗️ Arquitectura del Sistema (v5.0 Direct Inference Pipeline)
+
+En v5.0 se reemplazó la arquitectura de microservicios HTTP por un **Pipeline de Inferencia Directa Monolítico de Alto Rendimiento**:
+
+- **DirectInferenceEngine**: Carga los modelos YOLO (Keypoint, Jugadores/Árbitros, Balón) en memoria compartida (OpenVINO IR en CPU local / `.pt` nativo en GPU CUDA).
+- **TemporalHomographyTracker (v5.1)**: Estimación robusta de homografía $3D \to 2D$ con USAC_MAGSAC, filtrado cinemático de deriva de centro/esquinas y análisis de residuales.
+- **BallTracker**: Seguimiento cinemático y descarte de saltos anómalos del balón.
+- **AsyncVideoWriter (OPT-8)**: Escritura de video MP4 en hilo de fondo con buffer desacoplado.
+- **ThreadedOpenCVReader (OPT-9)**: Lectura y prefetching de frames de video en segundo plano con profiling integrado de lectura y decodificación (`read_and_decode`).
+- **Modo Headless**: En entornos como Kaggle o analítica batch, omite el renderizado de video y overlays para generar exclusivamente el contrato de datos JSON (`tracking_<video>.json`).
 
 ```
-projectScoutingData/
+                    ┌──────────────────────────────────────────────┐
+                    │            Video Source (.mp4)               │
+                    └──────────────────────┬───────────────────────┘
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────────────┐
+                    │      ThreadedOpenCVReader (OPT-9)            │
+                    │      Prefetching en Background + Profiling   │
+                    └──────────────────────┬───────────────────────┘
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────────────┐
+                    │         DirectInferenceEngine (v5.0)         │
+                    │  (Keypoint Detect + Player Detect + Ball)    │
+                    └──────────────────────┬───────────────────────┘
+                                           │
+                 ┌─────────────────────────┴─────────────────────────┐
+                 ▼                                                   ▼
+┌─────────────────────────────────┐                 ┌─────────────────────────────────┐
+│ TemporalHomographyTracker       │                 │ BallTracker & ByteTrack         │
+│ (USAC_MAGSAC + Rejection Audit) │                 │ (Player & Ball Trajectories)    │
+└────────────────┬────────────────┘                 └────────────────┬────────────────┘
+                 │                                                   │
+                 └─────────────────────────┬─────────────────────────┘
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────────────┐
+                    │  Headless: tracking_<video>.json Contract    │
+                    │  Full: AsyncVideoWriter (OPT-8) + Overlays   │
+                    └──────────────────────────────────────────────┘
+```
+
+---
+
+## 📁 Estructura del Proyecto v5.0
+
+```
+scoutingData_ProcessingEventing/
 │
 ├── app/
 │   ├── config/
-│   │   ├── settings.py           # Configuración por Entorno (LOCAL / KAGGLE)
-│   │   ├── field_dimensions.py   # Dimensiones oficiales de cancha FIFA
-│   │   ├── field_points.py       # Puntos de referencia 2D/3D
-│   │   └── variables.py          # Bridge para código legado
-│   ├── homography/               # Homografía e Inversa (pixel_to_field)
-│   ├── model/                    # Enlace a modelos OpenVINO
-│   ├── outputs/                  # Videos y CSVs de salida
-│   ├── services/                 # Microservicios FastAPI y Cliente Asíncrono
-│   ├── sports/                   # Ball tracker y annotators
-│   ├── visualization/            # Overlays, Pitch Template y 2D Minimap
-│   ├── main.py                   # Orquestador Principal CLI
-│   └── run_services.py           # Lanzador portátil de Microservicios
+│   │   ├── settings.py           # Configuración centralizada por entorno (LOCAL / KAGGLE)
+│   │   ├── field_dimensions.py   # Dimensiones oficiales FIFA
+│   │   └── field_points.py       # Puntos de referencia 2D/3D de la cancha
+│   ├── engine/
+│   │   ├── direct_inference.py   # Motor de inferencia directa (CUDA / OpenVINO)
+│   │   ├── async_writer.py       # AsyncVideoWriter en background (OPT-8)
+│   │   └── threaded_reader.py    # ThreadedOpenCVReader + profiling de read_and_decode (OPT-9)
+│   ├── homography/               # Homografía, tracking temporal y validaciones geométricas
+│   ├── model/                    # Modelos OpenVINO IR y PyTorch .pt
+│   ├── sports/                   # BallTracker cinemático
+│   ├── test/                     # Tests unitarios e integración (Headless, Audit, Threaded)
+│   ├── visualization/            # Overlays, template de cancha y minimap 2D
+│   └── main.py                   # Orquestador principal y CLI
 │
 ├── openVino/                     # Modelos OpenVINO IR (.xml / .bin)
-│   ├── modelPlayer_openvino_model/
-│   ├── modelBall_openvino_model/
-│   └── modelKeypoint_openvino_model/
-│
-├── outputs/                      # Carpeta principal de salidas
-├── data/                         # Videos de entrada locales
-├── requirements.txt              # Dependencias del proyecto
-├── kaggle_runner.py              # Script de ejecución autónoma en Kaggle
-└── README.md                     # Documentación oficial
+├── data/                         # Videos de prueba locales
+├── outputs/                      # Salidas generadas (JSON tracking, MP4, CSV rejections)
+├── docs/                         # Documentación técnica (HEADLESS_TRACKING.md)
+├── kaggle_runner.py              # Runner optimizado para ejecución autónoma en Kaggle
+└── requirements.txt              # Dependencias optimizadas del proyecto
 ```
 
 ---
 
-## 🚀 Guía de Instalación y Ejecución
+## 🚀 Instalación y Ejecución
 
 ### 1. Instalación de Dependencias
 ```bash
 git clone https://github.com/tu-usuario/projectScoutingData.git
-cd projectScoutingData
+cd projectScoutingData/scoutingData_ProcessingEventing
 pip install -r requirements.txt
 ```
 
@@ -77,35 +96,20 @@ pip install -r requirements.txt
 
 ### 2. Ejecución Local (Windows / Linux)
 
-#### Paso 1: Iniciar los Microservicios SOA
-En una terminal:
 ```bash
-python app/run_services.py
-```
-*(Esperar a que los 4 health checks confirmen `:8001`, `:8002`, `:8003`, `:8004` OK)*
+# Modo completo (Video con overlays + JSON de tracking)
+python app/main.py --video data/input.mp4 --output outputs/salida.mp4 --json outputs/tracking.json
 
-#### Paso 2: Ejecutar el Pipeline de Análisis
-En otra terminal:
-```bash
-python app/main.py --video data/mi_partido.mp4 --output outputs/salida.mp4 --csv outputs/eventos.csv
+# Modo Headless de alto rendimiento (solo tracking JSON, sin renderizar video)
+python app/main.py --video data/input.mp4 --headless --json outputs/tracking.json
 ```
 
 ---
 
 ### 3. Ejecución en Kaggle (GPU Tesla T4)
 
-En una celda de Notebook de Kaggle o Terminal:
-
-```python
-# 1. Clonar el repositorio
-!git clone https://github.com/tu-usuario/projectScoutingData.git
-%cd projectScoutingData
-
-# 2. Instalar requerimientos
-!pip install -r requirements.txt -q
-
-# 3. Ejecutar el Kaggle Runner Script
-!python kaggle_runner.py --video /kaggle/input/mi-dataset-futbol/partido.mp4 --output /kaggle/working/outputs/resultado.mp4
+```bash
+python kaggle_runner.py --video /kaggle/input/soccer-match/input.mp4 --output /kaggle/working/outputs/salida.mp4 --json /kaggle/working/outputs/tracking.json
 ```
 
 ---
@@ -116,15 +120,19 @@ En una celda de Notebook de Kaggle o Terminal:
 | :--- | :--- | :--- | :--- |
 | `--video` | `-v` | Ruta al video de entrada | `settings.DEFAULT_INPUT_VIDEO` |
 | `--output` | `-o` | Ruta del video procesado (.mp4) | `outputs/scouting_output.mp4` |
+| `--json` | `-j` | Ruta del JSON de tracking estructurado | Auto (`outputs/tracking_<name>.json`) |
 | `--csv` | `-c` | Ruta del archivo CSV de eventos | `outputs/events_output.csv` |
-| `--env` | `-e` | Fuerza el entorno (`LOCAL` o `KAGGLE`) | Detección Automática |
-| `--max-frames` | `-m` | Limita la cantidad de frames procesados | `None` (Procesa todo el video) |
+| `--headless` | | Ejecutar en modo Headless (sin video/overlays) | Auto según entorno |
+| `--max-frames` | `-m` | Limita la cantidad de frames a procesar | `None` (todo el video) |
+| `--homography-interval` | | Recalcular H cada N frames | `1` |
+| `--debug-homography` | | Logs forenses detallados de homografía | `False` |
+| `--disable-threaded-reader` | | Desactivar ThreadedOpenCVReader (usa lectura secuencial) | `False` |
+| `--reader-buffer` | | Tamaño del buffer de frames prefetcheados | `64` |
 
 ---
 
-## 🛠️ Variables de Entorno Soporta
+## 🧪 Ejecución de Tests
 
-- `ENVIRONMENT`: `"LOCAL"` o `"KAGGLE"`
-- `MODEL_DIR`: Ruta personalizada a los modelos OpenVINO.
-- `OPENVINO_DEVICE`: `"CPU"`, `"GPU"`, o `"AUTO"`.
-- `KEYPOINT_SERVICE_URL`, `PLAYER_SERVICE_URL`, `BALL_SERVICE_URL`, `EVENT_SERVICE_URL`: URLs para endpoints personalizados.
+```bash
+python -m unittest discover -s app/test
+```

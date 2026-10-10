@@ -1,16 +1,61 @@
 """
-ScoutingData v5.0 - Estimador de Homografía (Robustecido)
+ScoutingData v5.0 - Estimador de Homografía (Robustecido con USAC_MAGSAC y Diagnóstico Integral)
 """
 import logging
 import cv2
 import numpy as np
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from config.field_dimensions import FieldDimensions
 from config.field_points import FIELD_COORDS
 from homography.mappings import KP_MAP, LEFT_KEYPOINTS, RIGHT_KEYPOINTS, CENTER_KEYPOINTS
 from homography.validation import validate_homography_matrix
+from homography.geometric_validator import (
+    validate_keypoint_geometry,
+    filter_border_keypoints,
+    compute_convex_hull_and_coverage,
+    compute_collinearity_score,
+)
+from homography.metrics import HomographyDiagnostics, compute_reprojection_errors
+from homography.diagnostics_tool import compute_point_residuals
 
 logger = logging.getLogger("homography.estimator")
+
+# Seleccionar el método más robusto disponible en la versión de OpenCV
+if hasattr(cv2, "USAC_MAGSAC"):
+    DEFAULT_HOMOGRAPHY_METHOD = cv2.USAC_MAGSAC
+else:
+    DEFAULT_HOMOGRAPHY_METHOD = cv2.RANSAC
+
+
+class HomographyEstimateResult(tuple):
+    """
+    Tupla enriquecida compatible con desempaquetado de 6 valores clásico:
+    H, image_pts, field_pts, mask, inliers, outliers = compute_homography(...)
+    Además expone los atributos .diagnostics, .valid_candidates y .residuals para telemetría avanzada.
+    """
+    H: np.ndarray
+    image_pts: np.ndarray
+    field_pts: np.ndarray
+    mask: np.ndarray
+    inliers_count: int
+    outliers_count: int
+    diagnostics: HomographyDiagnostics
+    valid_candidates: list
+    residuals: list
+
+    def __new__(cls, H, image_pts, field_pts, mask, inliers_count, outliers_count, diagnostics=None, valid_candidates=None, residuals=None):
+        instance = super().__new__(cls, (H, image_pts, field_pts, mask, inliers_count, outliers_count))
+        instance.H = H
+        instance.image_pts = image_pts
+        instance.field_pts = field_pts
+        instance.mask = mask
+        instance.inliers_count = inliers_count
+        instance.outliers_count = outliers_count
+        instance.diagnostics = diagnostics
+        instance.valid_candidates = valid_candidates if valid_candidates is not None else []
+        instance.residuals = residuals if residuals is not None else []
+        return instance
+
 
 def filter_keypoints_by_pitch_side(
     kps_xy: np.ndarray,
@@ -69,12 +114,22 @@ def filter_keypoints_by_pitch_side(
     candidates.sort(key=lambda x: x[0])
     return candidates, discard_left, discard_right
 
+
 def compute_homography(
     result,
-    conf_threshold: float = 0.5,
-    ransac_threshold: float = 5.0,
-    enable_side_filter: bool = True
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
+    conf_threshold: float = 0.35,
+    ransac_threshold: float = 1.5,       # Umbral calibrado en metros (1.5m en terreno)
+    enable_side_filter: bool = True,
+    filter_border_margin_px: float = 4.0, # Descartar keypoints truncados en bordes de imagen
+    img_width: int = 1920,
+    img_height: int = 1080,
+    validate_geometry: bool = True,
+    method: int = DEFAULT_HOMOGRAPHY_METHOD,
+) -> HomographyEstimateResult:
+    """
+    Estima la homografía (imagen -> terreno) con validación geométrica previa,
+    algoritmo USAC_MAGSAC robusto y telemetría de diagnóstico.
+    """
     if (
         result is None
         or result.keypoints is None
@@ -90,6 +145,7 @@ def compute_homography(
     if len(kps_xy) == 0:
         raise ValueError("YOLO keypoints array is empty.")
 
+    # 1. Filtro de lado dominante de campo
     if enable_side_filter:
         valid_candidates, disc_l, disc_r = filter_keypoints_by_pitch_side(
             kps_xy, kps_conf, conf_threshold=conf_threshold
@@ -108,6 +164,12 @@ def compute_homography(
                 continue
             valid_candidates.append((idx, xy, float(conf), lbl))
 
+    # 2. Filtro de keypoints pegados al borde de pantalla (truncamiento de CNN)
+    if filter_border_margin_px > 0:
+        valid_candidates = filter_border_keypoints(
+            valid_candidates, img_width=img_width, img_height=img_height, border_margin_px=filter_border_margin_px
+        )
+
     image_pts_list = [xy for _, xy, _, _ in valid_candidates]
     field_pts_list = [FIELD_COORDS[lbl] for _, _, _, lbl in valid_candidates]
 
@@ -117,19 +179,88 @@ def compute_homography(
     if len(image_pts) < 4:
         raise ValueError(f"At least 4 keypoints required to compute homography. Found: {len(image_pts)}")
 
-    H, mask = cv2.findHomography(
-        image_pts,
-        field_pts,
-        cv2.RANSAC,
-        ransac_threshold
-    )
+    # 3. Validación geométrica previa (Colinealidad, Convex Hull, Dispersión)
+    if validate_geometry:
+        is_geom_ok, reason, geom_meta = validate_keypoint_geometry(
+            image_pts, field_pts, img_width=img_width, img_height=img_height
+        )
+        if not is_geom_ok:
+            raise ValueError(f"Configuración geométrica degenerada: {reason}")
+
+    # 4. Cálculo de Homografía Robusta (USAC_MAGSAC / RANSAC)
+    try:
+        H, mask = cv2.findHomography(
+            image_pts,
+            field_pts,
+            method,
+            ransac_threshold
+        )
+    except Exception as exc:
+        raise ValueError(f"OpenCV findHomography failed with exception: {exc}")
 
     if H is None or not validate_homography_matrix(H):
-        raise ValueError("Homography calculation failed (returned None or invalid matrix).")
+        raise ValueError("Homography calculation failed (returned None or singular/invalid matrix).")
+
+    # Asegurar mask como array 1D booleano/entero
+    if mask is None:
+        mask = np.ones((len(image_pts), 1), dtype=np.uint8)
 
     inliers_count = int(mask.sum())
     outliers_count = len(mask) - inliers_count
 
-    logger.info(f"Homography calculated. Inliers: {inliers_count}/{len(image_pts)} (Outliers: {outliers_count})")
+    # Si RANSAC dejó menos de 4 inliers, la homografía no está sustentada
+    if inliers_count < 4:
+        raise ValueError(f"Insufficient RANSAC inliers: {inliers_count} < 4")
 
-    return H, image_pts, field_pts, mask, inliers_count, outliers_count
+    # 5. Cálculo de métricas de diagnóstico
+    err_info = compute_reprojection_errors(H, image_pts, field_pts)
+    cov_info = compute_convex_hull_and_coverage(image_pts, field_pts, img_width=img_width, img_height=img_height)
+    collin_score = compute_collinearity_score(field_pts)
+
+    # Condición de la matriz normalizada
+    h_norm = H / (H[2, 2] if abs(H[2, 2]) > 1e-9 else 1.0)
+    try:
+        cond_num = float(np.linalg.cond(h_norm))
+    except Exception:
+        cond_num = 1e9
+
+    diag = HomographyDiagnostics(
+        kps_detected=int((kps_conf >= conf_threshold).sum()),
+        kps_used=len(image_pts),
+        ransac_inliers=inliers_count,
+        ransac_outliers=outliers_count,
+        inlier_ratio=float(inliers_count / len(image_pts)),
+        mean_reprojection_error_m=err_info["mean_error_m"],
+        max_reprojection_error_m=err_info["max_error_m"],
+        raw_errors_m=err_info["raw_errors_m"],
+        hull_area_image_px2=cov_info["hull_area_img_px2"],
+        hull_area_field_m2=cov_info["hull_area_field_m2"],
+        image_coverage_ratio=cov_info["image_coverage_ratio"],
+        field_coverage_ratio=cov_info["field_coverage_ratio"],
+        collinearity_score=collin_score,
+        condition_number=cond_num,
+        is_geometrically_degenerate=False,
+        is_low_longitudinal_span=bool(geom_meta.get("is_low_longitudinal_span", False)) if validate_geometry else False,
+        is_valid=True,
+        status_reason="OK",
+    )
+
+    # 6. Post-filtro: Si el error medio de reproyección es inaceptablemente alto (>2.5m)
+    if diag.mean_reprojection_error_m > 2.5:
+        raise ValueError(
+            f"Mean reprojection error too high ({diag.mean_reprojection_error_m:.2f}m > 2.5m). Rejecting H."
+        )
+
+    # 7. Residuales punto a punto para telemetría forense
+    residuals = compute_point_residuals(H, valid_candidates, mask)
+
+    logger.debug(
+        f"Homography calculated: inliers={inliers_count}/{len(image_pts)} | "
+        f"mean_err={diag.mean_reprojection_error_m:.2f}m | max_err={diag.max_reprojection_error_m:.2f}m | "
+        f"hull={diag.hull_area_field_m2:.0f}m²"
+    )
+
+    return HomographyEstimateResult(
+        H, image_pts, field_pts, mask, inliers_count, outliers_count,
+        diagnostics=diag, valid_candidates=valid_candidates, residuals=residuals
+    )

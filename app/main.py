@@ -9,6 +9,8 @@ Cambios vs v4.0:
   - Caché de minimap template (OPT-5)
   - Homografía cada N frames configurable (OPT-7)
   - AsyncVideoWriter para escritura en background (OPT-8)
+  - ThreadedOpenCVReader para lectura/decodificación asíncrona de video (OPT-9)
+  - Profiling de read_and_decode por frame y worker decode metrics
   - Renders in-place (sin .copy() redundantes) (OPT-6)
 """
 
@@ -16,7 +18,6 @@ import os
 import sys
 import time
 import logging
-import asyncio
 import json
 import argparse
 from pathlib import Path
@@ -32,11 +33,17 @@ from config import settings
 from config.field_dimensions import FieldDimensions
 from engine.direct_inference import DirectInferenceEngine
 from engine.async_writer import AsyncVideoWriter
+from engine.threaded_reader import ThreadedOpenCVReader
 from homography.estimator import compute_homography
-from homography.validation import is_homography_transition_valid, smooth_homography
+from homography.temporal_validator import TemporalHomographyTracker
 from homography.transforms import pixel_to_field
+from homography.diagnostics_tool import (
+    generate_residuals_table,
+    run_leave_one_out_analysis,
+    format_leave_one_out_report,
+    detect_spatial_anomalies_and_swaps,
+)
 from sports.ball_tracker import BallTracker
-from visualization.pitch import draw_pitch_template
 from visualization.overlays import (
     get_pitch_field_points,          # OPT-4: puntos pre-calculados
     draw_pitch_lines_on_image,
@@ -116,6 +123,9 @@ class SoccerAnalysisV5:
         homography_interval: int = settings.HOMOGRAPHY_INTERVAL,
         headless: Optional[bool] = None,
         draw_outliers: Optional[bool] = None,
+        enable_corner_shift: Optional[bool] = None,
+        use_threaded_reader: bool = True,
+        reader_buffer_size: int = 64,
     ):
         self.conf_keypoint   = conf_keypoint
         self.conf_player     = conf_player
@@ -126,6 +136,9 @@ class SoccerAnalysisV5:
         self.homography_interval = homography_interval
         self.headless        = headless if headless is not None else settings.HEADLESS_MODE
         self.draw_outliers   = draw_outliers if draw_outliers is not None else settings.DRAW_OUTLIERS
+        self.enable_corner_shift = enable_corner_shift if enable_corner_shift is not None else settings.ENABLE_CORNER_SHIFT
+        self.use_threaded_reader = use_threaded_reader
+        self.reader_buffer_size = reader_buffer_size
 
         # Motor de inferencia directa (sin HTTP)
         self.engine = DirectInferenceEngine()
@@ -141,10 +154,15 @@ class SoccerAnalysisV5:
         # Estado del tracker de balón
         self.ball_tracker = BallTracker()
 
-        # Caché de homografía (OPT-7)
+        # Tracker cinemático y caché de homografía (Robustez Temporal v5.1)
+        self.homography_tracker = TemporalHomographyTracker(
+            enable_corner_shift=self.enable_corner_shift,
+        )
         self._cached_H:    Optional[np.ndarray] = None
         self._cached_mask: Optional[np.ndarray] = None
         self._h_reject_streak: int = 0   # Contador de rechazos consecutivos para auto-reset
+        self._cached_field_coverage_ratio: float = 0.0
+        self._cached_hull_m2: float = 0.0
 
     def process_frame(
         self,
@@ -174,58 +192,84 @@ class SoccerAnalysisV5:
             ball_detection = raw_ball_det
             ball_history = [(raw_ball_det["pixel_x"], raw_ball_det["pixel_y"])] if raw_ball_det else []
 
-        # ── 3. Homografía (OPT-7: caché cada N frames con filtro de continuidad) ──
-        recalc = (frame_idx % self.homography_interval == 0) or (self._cached_H is None)
+        # ── 3. Homografía (Tracker cinemático temporal + USAC_MAGSAC) ──
+        recalc = (frame_idx % self.homography_interval == 0) or (self.homography_tracker.cached_H is None)
         if recalc:
+            h_img, w_img = frame_bgr.shape[:2]
+            H_cand = None
+            mask_cand = None
+            conf_weight = 1.0
+            diag = None
+            cand_reject_reason = None
+            cand_details = None
             try:
-                H_cand, _, _, mask, inliers, _ = compute_homography(
+                res = compute_homography(
                     kp_result,
                     conf_threshold=self.conf_keypoint,
                     ransac_threshold=self.ransac_threshold,
+                    img_width=w_img,
+                    img_height=h_img,
                 )
-                h_img, w_img = frame_bgr.shape[:2]
+                H_cand = res.H
+                mask_cand = res.mask
+                diag = getattr(res, "diagnostics", None)
+                if diag is not None:
+                    err_pen = 1.0 / max(0.5, diag.mean_reprojection_error_m)
+                    conf_weight = float(np.clip(diag.inlier_ratio * err_pen, 0.5, 1.5))
+                    self._cached_field_coverage_ratio = diag.field_coverage_ratio
+                    self._cached_hull_m2 = diag.hull_area_field_m2
 
-                # Auto-reset si llevamos demasiados rechazos consecutivos
-                # (indica que la caché actual está bloqueada en estado incorrecto)
-                if self._h_reject_streak >= 8:
-                    homography_logger.debug(
-                        f"[Frame {frame_idx}] 🔄 AUTO-RESET caché H tras {self._h_reject_streak} rechazos consecutivos"
+                # Telemetría forense detallada en modo debug
+                if self.draw_outliers and getattr(res, "residuals", None):
+                    homography_logger.info(
+                        f"\n[Frame {frame_idx}] 📋 TABLA DE RESIDUALES:\n"
+                        + generate_residuals_table(res.residuals)
                     )
-                    self._cached_H = None
-                    self._cached_mask = None
-                    self._h_reject_streak = 0
-
-                if is_homography_transition_valid(
-                    H_cand, self._cached_H,
-                    img_width=w_img, img_height=h_img,
-                    max_shift_m=35.0,   # Aumentado: permite correcciones de cámara más amplias
-                ):
-                    # alpha=0.7 → 70% nueva H, 30% anterior (más responsivo)
-                    H_smoothed = smooth_homography(H_cand, self._cached_H, alpha=0.7)
-                    self._cached_H    = H_smoothed
-                    self._cached_mask = mask
-                    self._h_reject_streak = 0
-                    homography_logger.debug(
-                        f"[Frame {frame_idx}] ✅ H aceptada | inliers={inliers} | EMA α=0.7"
-                    )
-                elif self._cached_H is None:
-                    # Primera H: aceptar directamente sin suavizado
-                    self._cached_H    = H_cand
-                    self._cached_mask = mask
-                    self._h_reject_streak = 0
-                    homography_logger.debug(
-                        f"[Frame {frame_idx}] ✅ H inicial aceptada | inliers={inliers}"
-                    )
-                else:
-                    self._h_reject_streak += 1
-                    homography_logger.debug(
-                        f"[Frame {frame_idx}] ⚠ H RECHAZADA (streak={self._h_reject_streak}) "
-                        f"| inliers={inliers} — se mantiene caché anterior"
-                    )
+                    anomalies = detect_spatial_anomalies_and_swaps(res.residuals)
+                    for anom in anomalies:
+                        homography_logger.warning(
+                            f"[Frame {frame_idx}] 🚨 {anom['type']} ({anom['severity']}): {anom['message']}"
+                        )
+                    if len(getattr(res, "valid_candidates", [])) >= 5:
+                        loo_res, loo_meta = run_leave_one_out_analysis(res.valid_candidates)
+                        homography_logger.info(
+                            f"\n[Frame {frame_idx}] 🔬 " + format_leave_one_out_report(loo_res, loo_meta)
+                        )
             except Exception as exc:
-                self._h_reject_streak += 1
+                cand_details = str(exc)
+                exc_str = cand_details.lower()
+                if "colineal" in exc_str:
+                    cand_reject_reason = "COLLINEARITY"
+                elif "cobertura" in exc_str or "área cubierta" in exc_str or "dispersión" in exc_str:
+                    cand_reject_reason = "LOW_COVERAGE"
+                else:
+                    cand_reject_reason = "NO_HOMOGRAPHY"
                 homography_logger.debug(
-                    f"[Frame {frame_idx}] ✖ compute_homography falló (streak={self._h_reject_streak}): {exc}"
+                    f"[Frame {frame_idx}] ✖ compute_homography descartó candidato: {exc}"
+                )
+
+            H_eff, mask_eff, status, trans_meta = self.homography_tracker.update(
+                H_cand, mask_cand,
+                img_width=w_img, img_height=h_img,
+                confidence_weight=conf_weight,
+                frame_id=frame_idx,
+                diagnostics=diag,
+                candidate_reject_reason=cand_reject_reason,
+                details=cand_details,
+            )
+            self._cached_H = H_eff
+            self._cached_mask = mask_eff
+            self._h_reject_streak = self.homography_tracker.reject_streak
+
+            if status in ("INITIAL_ACCEPTED", "ACCEPTED_SMOOTHED", "RESET_ACCEPTED"):
+                inliers_str = f"inliers={diag.ransac_inliers}/{diag.kps_used}" if diag else "inliers=OK"
+                shift_str = f"| dC={trans_meta.get('center_shift_m', 0.0):.1f}m" if trans_meta else ""
+                homography_logger.debug(
+                    f"[Frame {frame_idx}] ✅ H {status} | {inliers_str} {shift_str}"
+                )
+            else:
+                homography_logger.debug(
+                    f"[Frame {frame_idx}] ⚠ H {status} (streak={self._h_reject_streak}) — manteniendo previa"
                 )
 
         H    = self._cached_H
@@ -286,6 +330,10 @@ class SoccerAnalysisV5:
                 annotated, kp_result, mask=mask,
                 conf_threshold=self.conf_keypoint,
                 draw_outliers=self.draw_outliers,
+                field_coverage_ratio=self._cached_field_coverage_ratio,
+                hull_area_m2=self._cached_hull_m2,
+                H=H,
+                draw_residuals=self.draw_outliers,
             )
 
         draw_player_detections(annotated, player_result,
@@ -303,6 +351,8 @@ class SoccerAnalysisV5:
                 conf_threshold=self.conf_keypoint,
                 mask=mask, scale=self.minimap_scale,
                 cached_template=self._minimap_template,   # OPT-5
+                field_coverage_ratio=self._cached_field_coverage_ratio,
+                hull_area_m2=self._cached_hull_m2,
             )
             draw_player_projections_on_minimap(
                 minimap, player_result, H=H,
@@ -328,31 +378,46 @@ class SoccerAnalysisV5:
         max_frames: Optional[int] = None,
         headless: Optional[bool] = None,
         debug_homography: bool = False,
+        rejections_csv_path: Optional[str] = None,
+        use_threaded_reader: Optional[bool] = None,
+        reader_buffer_size: Optional[int] = None,
     ) -> List[Dict]:
         import csv
 
         is_headless = headless if headless is not None else self.headless
+        use_reader  = use_threaded_reader if use_threaded_reader is not None else self.use_threaded_reader
+        buf_size    = reader_buffer_size if reader_buffer_size is not None else self.reader_buffer_size
 
         resolved = settings.resolve_video_source(video_path)
         if not resolved.exists():
             raise FileNotFoundError(f"Video no encontrado: {resolved}")
 
-        cap = cv2.VideoCapture(str(resolved))
-        if not cap.isOpened():
+        # Configurar destino de CSV para rechazos de homografía
+        actual_rejections_csv = rejections_csv_path or str(settings.OUTPUT_DIR / f"rejections_{resolved.stem}.csv")
+        self.homography_tracker.csv_path = actual_rejections_csv
+
+        # OPT-9: ThreadedOpenCVReader (prefetching asíncrono + profiling)
+        if use_reader:
+            reader = ThreadedOpenCVReader(str(resolved), buffer_size=buf_size)
+        else:
+            reader = cv2.VideoCapture(str(resolved))
+
+        if not reader.isOpened():
             raise RuntimeError(f"No se pudo abrir el video: {resolved}")
 
-        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps    = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
-        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width  = int(reader.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(reader.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps    = float(reader.get(cv2.CAP_PROP_FPS)) or 25.0
+        total  = int(reader.get(cv2.CAP_PROP_FRAME_COUNT))
 
         cuda_info = f" (CUDA: {settings.CUDA_AVAILABLE})" if settings.INFERENCE_DEVICE == "cuda" else ""
+        reader_info = f" | ThreadedReader (buf={buf_size})" if use_reader else " | SequentialReader"
         # Frames efectivos a procesar (respetando max_frames)
         effective_total = min(total, max_frames) if max_frames else total
         limit_str = f" [límite: {max_frames}]" if max_frames else ""
         logger.info(
             f"📹 {resolved.name} | {width}x{height} @ {fps:.1f}fps | "
-            f"{total} frames totales{limit_str} | {settings.INFERENCE_DEVICE.upper()} {settings.MODEL_FORMAT.upper()}{cuda_info}"
+            f"{total} frames totales{limit_str} | {settings.INFERENCE_DEVICE.upper()} {settings.MODEL_FORMAT.upper()}{cuda_info}{reader_info}"
         )
         if debug_homography:
             _enable_debug_mode()
@@ -369,16 +434,20 @@ class SoccerAnalysisV5:
         tracking_frames: List[Dict] = []
 
         # ── Acumuladores de tiempo por fase ─────────────────────────────────
-        total_inference_time  = 0.0
-        total_tracking_time   = 0.0
-        total_homography_time = 0.0
-        total_json_time       = 0.0
-        total_video_time      = 0.0
+        total_read_decode_time = 0.0
+        total_inference_time   = 0.0
+        total_tracking_time    = 0.0
+        total_homography_time  = 0.0
+        total_json_time        = 0.0
+        total_video_time       = 0.0
 
         try:
-            while cap.isOpened():
-                ret, frame_bgr = cap.read()
-                if not ret:
+            while reader.isOpened():
+                # ── Fase 0: Lectura y Decodificación (read_and_decode) ──────
+                _t_read0 = time.perf_counter()
+                ret, frame_bgr = reader.read()
+                total_read_decode_time += time.perf_counter() - _t_read0
+                if not ret or frame_bgr is None:
                     break
                 frame_count += 1
                 if max_frames and frame_count > max_frames:
@@ -452,7 +521,7 @@ class SoccerAnalysisV5:
                     print(f"\r  [{bar}] {pct:5.1f}%  {frame_count}/{effective_total}  {fps_avg:.1f} FPS", end="", flush=True)
 
         finally:
-            cap.release()
+            reader.release()
             if writer:
                 writer.release()
             print()  # Salto de línea tras la barra de progreso
@@ -472,6 +541,10 @@ class SoccerAnalysisV5:
                     "model_format": settings.MODEL_FORMAT,
                     "cuda_available": settings.CUDA_AVAILABLE,
                     "environment": settings.ENVIRONMENT,
+                },
+                "performance": {
+                    "read_and_decode_sec": round(total_read_decode_time, 4),
+                    "reader_metrics": reader.get_metrics() if hasattr(reader, "get_metrics") else None,
                 },
             },
             "frames": tracking_frames,
@@ -515,6 +588,13 @@ class SoccerAnalysisV5:
         logger.info(f"   FPS promedio:      {fps_final:.2f}")
         logger.info("-" * 65)
         logger.info("⏱  DESGLOSE DE TIEMPOS POR FASE:")
+        logger.info(f"   Total read & decode:{total_read_decode_time:.2f}s  ({_pct(total_read_decode_time)} del total)")
+        if hasattr(reader, "get_metrics"):
+            m = reader.get_metrics()
+            logger.info(
+                f"     └─ Worker decode:  {m['total_decode_time_s']:.2f}s "
+                f"({m['avg_decode_time_ms']:.2f} ms/frame, {m['decode_fps']:.1f} FPS, wait={m['total_consumer_wait_s']:.3f}s)"
+            )
         logger.info(f"   Total inferencia:  {total_inference_time:.2f}s  ({_pct(total_inference_time)} del total)")
         logger.info(f"   Total tracking:    {total_tracking_time:.2f}s  ({_pct(total_tracking_time)} del total)")
         logger.info(f"   Total homography:  {total_homography_time:.2f}s  ({_pct(total_homography_time)} del total)")
@@ -526,6 +606,13 @@ class SoccerAnalysisV5:
             logger.info(f"   MP4 Output:        {output_path}")
         logger.info("=" * 65)
 
+        # ── Estadísticas de Rechazos de Homografía y Exportación CSV ──────────
+        rejection_summary = self.homography_tracker.get_rejection_summary()
+        logger.info("\n" + rejection_summary)
+        saved_rejections_csv = self.homography_tracker.save_rejections_to_csv(actual_rejections_csv)
+        logger.info(f"📄 CSV de rechazos exportado: {saved_rejections_csv}")
+        logger.info("=" * 65)
+
         return all_events
 
 
@@ -534,10 +621,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="ScoutingData v5.0 — Soccer Analysis Pipeline (Direct + OpenVINO/CUDA)"
     )
-    parser.add_argument("--video",  "-v", default=settings.DEFAULT_INPUT_VIDEO, help="Video de entrada")
+    parser.add_argument("--video",  "-v", default=settings.DEFAULT_INPUT_VIDEO,  help="Video de entrada")
     parser.add_argument("--output", "-o", default=settings.DEFAULT_OUTPUT_VIDEO, help="Video de salida MP4")
     parser.add_argument("--csv",    "-c", default=settings.DEFAULT_OUTPUT_CSV,   help="CSV de eventos")
     parser.add_argument("--json",   "-j", default=None,                          help="JSON de tracking output")
+    parser.add_argument("--rejections-csv", default=None,                        help="CSV para exportar rechazos de homografía")
     parser.add_argument("--env",    "-e", choices=["LOCAL", "KAGGLE"],           help="Forzar entorno")
     parser.add_argument("--headless", action="store_true", default=None,         help="Modo headless (Sin renderizar MP4/Overlays)")
     parser.add_argument("--max-frames", "-m", type=int, default=None,            help="Límite de frames")
@@ -546,6 +634,12 @@ def main():
                         help="Recalcular H cada N frames (1=cada frame, 5=cada 5 frames)")
     parser.add_argument("--debug-homography", action="store_true", default=False,
                         help="Activar logs detallados de homografía e inferencia por frame")
+    parser.add_argument("--disable-corner-shift", action="store_true", default=False,
+                        help="Desactivar temporalmente verificación de deriva de esquinas (prueba A/B)")
+    parser.add_argument("--disable-threaded-reader", action="store_true", default=False,
+                        help="Desactivar ThreadedOpenCVReader y usar cv2.VideoCapture secuencial")
+    parser.add_argument("--reader-buffer", type=int, default=64,
+                        help="Tamaño de buffer de frames para ThreadedOpenCVReader (default: 64)")
     args = parser.parse_args()
 
     if args.env:
@@ -564,6 +658,9 @@ def main():
     pipeline = SoccerAnalysisV5(
         homography_interval=args.homography_interval,
         headless=args.headless,
+        enable_corner_shift=not args.disable_corner_shift,
+        use_threaded_reader=not args.disable_threaded_reader,
+        reader_buffer_size=args.reader_buffer,
     )
 
     resolved = settings.resolve_video_source(args.video)
@@ -576,6 +673,9 @@ def main():
             max_frames=args.max_frames,
             headless=args.headless,
             debug_homography=args.debug_homography,
+            rejections_csv_path=args.rejections_csv,
+            use_threaded_reader=not args.disable_threaded_reader,
+            reader_buffer_size=args.reader_buffer,
         )
     else:
         logger.warning(f"Video no encontrado: {resolved}")
