@@ -37,6 +37,7 @@ from engine.threaded_reader import ThreadedOpenCVReader
 from homography.estimator import compute_homography
 from homography.temporal_validator import TemporalHomographyTracker
 from homography.transforms import pixel_to_field
+from homography.keypoint_audit_logger import KeypointAuditLogger
 from homography.diagnostics_tool import (
     generate_residuals_table,
     run_leave_one_out_analysis,
@@ -44,6 +45,7 @@ from homography.diagnostics_tool import (
     detect_spatial_anomalies_and_swaps,
 )
 from sports.ball_tracker import BallTracker
+from sports.team_detector import TeamDetector
 from visualization.overlays import (
     get_pitch_field_points,          # OPT-4: puntos pre-calculados
     draw_pitch_lines_on_image,
@@ -106,6 +108,39 @@ def _extract_ball_detection(ball_result, conf_threshold: float) -> Optional[Dict
     }
 
 
+def _deduplicate_player_detections(detections: List[Dict], iou_thresh: float = 0.45) -> List[Dict]:
+    """Suprime detecciones duplicadas del mismo jugador en el mismo frame (ej. sobreposición de tracks)."""
+    if len(detections) <= 1:
+        return detections
+    sorted_dets = sorted(detections, key=lambda d: d.get("confidence", 0.0), reverse=True)
+    kept: List[Dict] = []
+    for det in sorted_dets:
+        b1 = det.get("bbox")
+        if not b1 or len(b1) != 4:
+            kept.append(det)
+            continue
+        is_dup = False
+        for k in kept:
+            b2 = k.get("bbox")
+            if not b2 or len(b2) != 4:
+                continue
+            ix1, iy1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+            ix2, iy2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+            iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+            inter = iw * ih
+            if inter > 0:
+                area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+                area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+                denom = area1 + area2 - inter
+                iou = inter / denom if denom > 0 else 0.0
+                if iou >= iou_thresh:
+                    is_dup = True
+                    break
+        if not is_dup:
+            kept.append(det)
+    return kept
+
+
 class SoccerAnalysisV5:
     """
     Pipeline de análisis v5.0: Inferencia directa + renders cacheados / Modo Headless.
@@ -126,6 +161,8 @@ class SoccerAnalysisV5:
         enable_corner_shift: Optional[bool] = None,
         use_threaded_reader: bool = True,
         reader_buffer_size: int = 64,
+        player_stride: int = settings.PLAYER_INFERENCE_STRIDE,
+        show_frame_number: Optional[bool] = None,
     ):
         self.conf_keypoint   = conf_keypoint
         self.conf_player     = conf_player
@@ -139,6 +176,13 @@ class SoccerAnalysisV5:
         self.enable_corner_shift = enable_corner_shift if enable_corner_shift is not None else settings.ENABLE_CORNER_SHIFT
         self.use_threaded_reader = use_threaded_reader
         self.reader_buffer_size = reader_buffer_size
+        self.player_stride   = max(1, player_stride)
+        self.show_frame_number = (
+            show_frame_number
+            if show_frame_number is not None
+            else getattr(settings, "SHOW_FRAME_NUMBER", settings.ENVIRONMENT == "LOCAL")
+        )
+
 
         # Motor de inferencia directa (sin HTTP)
         self.engine = DirectInferenceEngine()
@@ -154,6 +198,18 @@ class SoccerAnalysisV5:
         # Estado del tracker de balón
         self.ball_tracker = BallTracker()
 
+        # Clasificador de equipos y color de camiseta (Fases 1 y 2)
+        self.team_detector = TeamDetector(
+            pitch_length=field_dims.length,
+            pitch_width=field_dims.width,
+        )
+
+        # Buffers cinemáticos para tracking y multi-rate player inference (Fase 2)
+        self._last_player_dets: List[Dict] = []
+        self._last_player_result = None
+        self._player_positions: Dict[int, Tuple[float, float]] = {}
+        self._player_velocities: Dict[int, Tuple[float, float]] = {}
+
         # Tracker cinemático y caché de homografía (Robustez Temporal v5.1)
         self.homography_tracker = TemporalHomographyTracker(
             enable_corner_shift=self.enable_corner_shift,
@@ -163,6 +219,10 @@ class SoccerAnalysisV5:
         self._h_reject_streak: int = 0   # Contador de rechazos consecutivos para auto-reset
         self._cached_field_coverage_ratio: float = 0.0
         self._cached_hull_m2: float = 0.0
+
+        # Registrador forense y auditoría punto a punto de keypoints (Local y Nube)
+        self.keypoint_audit_logger = KeypointAuditLogger()
+
 
     def process_frame(
         self,
@@ -176,13 +236,23 @@ class SoccerAnalysisV5:
         is_headless = headless if headless is not None else self.headless
 
         # ── 1. Inferencia Directa ────────────────────────────────────────────
-        kp_result, player_result, ball_result = self.engine.infer(
-            frame_bgr,
-            conf_kp=self.conf_keypoint,
-            conf_player=self.conf_player,
-            conf_ball=self.conf_ball,
-            is_video=is_video,
-        )
+        should_infer_players = (frame_idx % self.player_stride == 0) or (len(self._last_player_dets) == 0)
+        if should_infer_players:
+            kp_result, player_result, ball_result = self.engine.infer(
+                frame_bgr,
+                conf_kp=self.conf_keypoint,
+                conf_player=self.conf_player,
+                conf_ball=self.conf_ball,
+                is_video=is_video,
+            )
+            self._last_player_result = player_result
+        else:
+            # En frames omitidos para inferencia de jugadores (Fase 2):
+            # Keypoints y balón se ejecutan con normalidad (keypoints no desacoplado)
+            kp_result = self.engine.infer_keypoints(frame_bgr, conf=self.conf_keypoint)
+            ball_result = self.engine.infer_ball(frame_bgr, conf=self.conf_ball)
+            player_result = self._last_player_result
+
 
         # ── 2. Ball Tracker ──────────────────────────────────────────────────
         raw_ball_det = _extract_ball_detection(ball_result, self.conf_ball)
@@ -194,14 +264,17 @@ class SoccerAnalysisV5:
 
         # ── 3. Homografía (Tracker cinemático temporal + USAC_MAGSAC) ──
         recalc = (frame_idx % self.homography_interval == 0) or (self.homography_tracker.cached_H is None)
+        H_cand = None
+        cand_residuals = None
+        cand_reject_reason = None
+        cand_details = None
+        status = "HELD_INTERVAL"
+
         if recalc:
             h_img, w_img = frame_bgr.shape[:2]
-            H_cand = None
             mask_cand = None
             conf_weight = 1.0
             diag = None
-            cand_reject_reason = None
-            cand_details = None
             try:
                 res = compute_homography(
                     kp_result,
@@ -213,6 +286,7 @@ class SoccerAnalysisV5:
                 H_cand = res.H
                 mask_cand = res.mask
                 diag = getattr(res, "diagnostics", None)
+                cand_residuals = getattr(res, "residuals", None)
                 if diag is not None:
                     err_pen = 1.0 / max(0.5, diag.mean_reprojection_error_m)
                     conf_weight = float(np.clip(diag.inlier_ratio * err_pen, 0.5, 1.5))
@@ -220,12 +294,12 @@ class SoccerAnalysisV5:
                     self._cached_hull_m2 = diag.hull_area_field_m2
 
                 # Telemetría forense detallada en modo debug
-                if self.draw_outliers and getattr(res, "residuals", None):
+                if self.draw_outliers and cand_residuals:
                     homography_logger.info(
                         f"\n[Frame {frame_idx}] 📋 TABLA DE RESIDUALES:\n"
-                        + generate_residuals_table(res.residuals)
+                        + generate_residuals_table(cand_residuals)
                     )
-                    anomalies = detect_spatial_anomalies_and_swaps(res.residuals)
+                    anomalies = detect_spatial_anomalies_and_swaps(cand_residuals)
                     for anom in anomalies:
                         homography_logger.warning(
                             f"[Frame {frame_idx}] 🚨 {anom['type']} ({anom['severity']}): {anom['message']}"
@@ -272,6 +346,23 @@ class SoccerAnalysisV5:
                     f"[Frame {frame_idx}] ⚠ H {status} (streak={self._h_reject_streak}) — manteniendo previa"
                 )
 
+        # ── 3.1 Registrar auditoría forense punto a punto de keypoints ──
+        h_img, w_img = frame_bgr.shape[:2]
+        self.keypoint_audit_logger.log_frame(
+            frame_idx=frame_idx,
+            timestamp_sec=timestamp_sec,
+            kp_result=kp_result,
+            homography_status=status,
+            H_effective=self._cached_H,
+            H_candidate=H_cand,
+            residuals=cand_residuals,
+            compute_error_reason=cand_reject_reason,
+            compute_error_details=cand_details,
+            conf_threshold=self.conf_keypoint,
+            img_width=w_img,
+            img_height=h_img,
+        )
+
         H    = self._cached_H
         mask = self._cached_mask
 
@@ -284,33 +375,73 @@ class SoccerAnalysisV5:
             ball_detection["pitch_x_m"] = None
             ball_detection["pitch_y_m"] = None
 
-        # ── 4. Player Detections ─────────────────────────────────────────────
+        # ── 4. Player Detections, Tracking & Jersey Colors ───────────────────
         player_detections: List[Dict] = []
-        if player_result.boxes is not None and len(player_result.boxes.xyxy) > 0:
-            boxes     = player_result.boxes.xyxy.cpu().numpy()
-            confs     = player_result.boxes.conf.cpu().numpy()
-            classes   = player_result.boxes.cls.cpu().numpy()
-            track_ids = (
-                player_result.boxes.id.cpu().numpy().astype(int)
-                if player_result.boxes.id is not None else None
+        if should_infer_players:
+            if player_result is not None and player_result.boxes is not None and len(player_result.boxes.xyxy) > 0:
+                boxes     = player_result.boxes.xyxy.cpu().numpy()
+                confs     = player_result.boxes.conf.cpu().numpy()
+                classes   = player_result.boxes.cls.cpu().numpy()
+                track_ids = (
+                    player_result.boxes.id.cpu().numpy().astype(int)
+                    if player_result.boxes.id is not None else None
+                )
+                for idx, (box, conf, cls_id) in enumerate(zip(boxes, confs, classes)):
+                    if conf < self.conf_player:
+                        continue
+                    x1, y1, x2, y2 = box
+                    xc = float((x1 + x2) / 2)
+                    yb = float(y2)
+                    p_id = int(track_ids[idx]) if track_ids is not None else idx
+                    fx, fy = (pixel_to_field(xc, yb, H) if H is not None else (None, None))
+
+                    # Actualizar velocidad para interpolación cinemática (Fase 2)
+                    if p_id in self._player_positions:
+                        prev_xc, prev_yb = self._player_positions[p_id]
+                        self._player_velocities[p_id] = (xc - prev_xc, yb - prev_yb)
+                    else:
+                        self._player_velocities[p_id] = (0.0, 0.0)
+                    self._player_positions[p_id] = (xc, yb)
+
+                    player_detections.append({
+                        "player_id":   p_id,
+                        "class_id":    int(cls_id),
+                        "confidence":  float(conf),
+                        "bbox":        [round(float(x1), 2), round(float(y1), 2), round(float(x2), 2), round(float(y2), 2)],
+                        "pixel_x":     round(xc, 2),
+                        "pixel_y":     round(yb, 2),
+                        "pitch_x_m":   round(fx, 2) if fx is not None else None,
+                        "pitch_y_m":   round(fy, 2) if fy is not None else None,
+                        "is_interpolated": False,
+                    })
+
+            # Deduplicación intra-frame para eliminar tracks gemelos/solapados en el mismo frame
+            player_detections = _deduplicate_player_detections(
+                player_detections,
+                iou_thresh=getattr(settings, "PLAYER_NMS_IOU", 0.45)
             )
-            for idx, (box, conf, cls_id) in enumerate(zip(boxes, confs, classes)):
-                if conf < self.conf_player:
-                    continue
-                x1, y1, x2, y2 = box
-                xc = float((x1 + x2) / 2)
-                yb = float(y2)
-                p_id = int(track_ids[idx]) if track_ids is not None else idx
-                fx, fy = (pixel_to_field(xc, yb, H) if H is not None else (None, None))
-                player_detections.append({
-                    "player_id":   p_id,
-                    "class_id":    int(cls_id),
-                    "confidence":  float(conf),
-                    "pixel_x":     round(xc, 2),
-                    "pixel_y":     round(yb, 2),
-                    "pitch_x_m":   round(fx, 2) if fx is not None else None,
-                    "pitch_y_m":   round(fy, 2) if fy is not None else None,
-                })
+
+            # Clasificación de camisetas y equipos (Fases 1 y 2)
+            self.team_detector.annotate_player_detections(frame_bgr, player_detections, frame_idx=frame_idx)
+            self._last_player_dets = [dict(p) for p in player_detections]
+        else:
+            # Extrapolación cinemática en frames intermedios (Fase 2)
+            for p_prev in self._last_player_dets:
+                p = dict(p_prev)
+                p_id = p["player_id"]
+                vx, vy = self._player_velocities.get(p_id, (0.0, 0.0))
+                p["pixel_x"] = round(p["pixel_x"] + vx, 2)
+                p["pixel_y"] = round(p["pixel_y"] + vy, 2)
+                if p.get("bbox") is not None:
+                    bx1, by1, bx2, by2 = p["bbox"]
+                    p["bbox"] = [round(bx1 + vx, 2), round(by1 + vy, 2), round(bx2 + vx, 2), round(by2 + vy, 2)]
+                if H is not None:
+                    fx, fy = pixel_to_field(p["pixel_x"], p["pixel_y"], H)
+                    p["pitch_x_m"] = round(fx, 2) if fx is not None else None
+                    p["pitch_y_m"] = round(fy, 2) if fy is not None else None
+                p["is_interpolated"] = True
+                player_detections.append(p)
+            self._last_player_dets = [dict(p) for p in player_detections]
 
         # Si estamos en modo headless, omitir renderizado OpenCV (Overlays, Minimap, cvtColor)
         if is_headless:
@@ -318,6 +449,9 @@ class SoccerAnalysisV5:
 
         # ── 5. Render Camera Frame (OPT-6: in-place, sin copias extra) ──────
         annotated = frame_bgr.copy()   # Una sola copia al inicio
+
+        # Pintar nro de frame en LOCAL (al costado de Field Coverage)
+        display_frame_idx = frame_idx if self.show_frame_number else None
 
         if H is not None:
             # OPT-4: usar puntos pre-calculados, solo aplicar H_inv
@@ -334,9 +468,24 @@ class SoccerAnalysisV5:
                 hull_area_m2=self._cached_hull_m2,
                 H=H,
                 draw_residuals=self.draw_outliers,
+                frame_idx=display_frame_idx,
+            )
+        elif display_frame_idx is not None:
+            # Si H todavía no está disponible pero estamos en LOCAL, dibujar badge de frame
+            draw_calibration_overlay(
+                annotated, kp_result, mask=mask,
+                conf_threshold=self.conf_keypoint,
+                draw_outliers=self.draw_outliers,
+                field_coverage_ratio=self._cached_field_coverage_ratio,
+                hull_area_m2=self._cached_hull_m2,
+                H=None,
+                draw_residuals=False,
+                frame_idx=display_frame_idx,
             )
 
+
         draw_player_detections(annotated, player_result,
+                               player_detections=player_detections,
                                conf_threshold=self.conf_player,
                                ellipse_color=(255, 0, 255))
         draw_ball_detections(annotated, ball_detection=ball_detection,
@@ -355,13 +504,16 @@ class SoccerAnalysisV5:
                 hull_area_m2=self._cached_hull_m2,
             )
             draw_player_projections_on_minimap(
-                minimap, player_result, H=H,
+                minimap, player_result,
+                player_detections=player_detections,
+                H=H,
                 conf_threshold=self.conf_player,
                 scale=self.minimap_scale, player_color=(255, 0, 255),
             )
             draw_ball_projection_on_minimap(
                 minimap, ball_detection=ball_detection, scale=self.minimap_scale,
             )
+
         else:
             minimap = self._minimap_template.copy()
 
@@ -379,6 +531,7 @@ class SoccerAnalysisV5:
         headless: Optional[bool] = None,
         debug_homography: bool = False,
         rejections_csv_path: Optional[str] = None,
+        keypoints_csv_path: Optional[str] = None,
         use_threaded_reader: Optional[bool] = None,
         reader_buffer_size: Optional[int] = None,
     ) -> List[Dict]:
@@ -392,9 +545,12 @@ class SoccerAnalysisV5:
         if not resolved.exists():
             raise FileNotFoundError(f"Video no encontrado: {resolved}")
 
-        # Configurar destino de CSV para rechazos de homografía
+        # Configurar destino de CSV para rechazos de homografía y auditoría de keypoints
         actual_rejections_csv = rejections_csv_path or str(settings.OUTPUT_DIR / f"rejections_{resolved.stem}.csv")
         self.homography_tracker.csv_path = actual_rejections_csv
+
+        actual_keypoints_csv = keypoints_csv_path or str(settings.OUTPUT_DIR / f"keypoints_audit_{resolved.stem}.csv")
+        self.keypoint_audit_logger = KeypointAuditLogger(output_csv_path=actual_keypoints_csv)
 
         # OPT-9: ThreadedOpenCVReader (prefetching asíncrono + profiling)
         if use_reader:
@@ -449,9 +605,10 @@ class SoccerAnalysisV5:
                 total_read_decode_time += time.perf_counter() - _t_read0
                 if not ret or frame_bgr is None:
                     break
-                frame_count += 1
-                if max_frames and frame_count > max_frames:
+                if max_frames and frame_count >= max_frames:
                     break
+                frame_count += 1
+
 
                 ts = frame_count / fps
 
@@ -473,6 +630,14 @@ class SoccerAnalysisV5:
                     "players": [
                         {
                             "track_id": p["player_id"],
+                            "player_id": p["player_id"],
+                            "role": p.get("role", "player"),
+                            "team_id": p.get("team_id", 0),
+                            "team_color": p.get("team_color", {}),
+                            "team_confidence": p.get("team_confidence", 1.0),
+                            "tracking_confidence": p.get("confidence", 1.0),
+                            "is_interpolated": p.get("is_interpolated", False),
+                            "bbox": p.get("bbox"),
                             "pixel_x": p["pixel_x"],
                             "pixel_y": p["pixel_y"],
                             "pitch_x": p["pitch_x_m"],
@@ -481,10 +646,14 @@ class SoccerAnalysisV5:
                         for p in player_dets
                     ],
                     "ball": {
+                        "detected": True,
+                        "confidence": ball_det.get("confidence", 1.0),
+                        "bbox": ball_det.get("bbox"),
                         "pixel_x": ball_det["pixel_x"],
                         "pixel_y": ball_det["pixel_y"],
                         "pitch_x": ball_det["pitch_x_m"],
                         "pitch_y": ball_det["pitch_y_m"],
+                        "is_interpolated": ball_det.get("interpolated", False),
                     } if ball_det is not None else None,
                     "homography_valid": bool(H is not None),
                 }
@@ -536,6 +705,11 @@ class SoccerAnalysisV5:
                 "fps": round(fps, 2),
                 "total_frames": frame_count,
                 "duration_seconds": duration_sec,
+                "teams": self.team_detector.get_teams_metadata(),
+                "tracking_config": {
+                    "tracker": getattr(settings, "TRACKER_TYPE", "botsort"),
+                    "player_stride": self.player_stride,
+                },
                 "inference": {
                     "device": settings.INFERENCE_DEVICE,
                     "model_format": settings.MODEL_FORMAT,
@@ -546,10 +720,13 @@ class SoccerAnalysisV5:
                     "read_and_decode_sec": round(total_read_decode_time, 4),
                     "reader_metrics": reader.get_metrics() if hasattr(reader, "get_metrics") else None,
                 },
+                "keypoints_audit_csv": actual_keypoints_csv,
+                "rejections_csv": actual_rejections_csv,
             },
             "frames": tracking_frames,
             "events": [],
         }
+
 
         actual_json_path = json_output_path or str(settings.OUTPUT_DIR / f"tracking_{resolved.stem}.json")
         json_path_obj = Path(actual_json_path)
@@ -611,6 +788,12 @@ class SoccerAnalysisV5:
         logger.info("\n" + rejection_summary)
         saved_rejections_csv = self.homography_tracker.save_rejections_to_csv(actual_rejections_csv)
         logger.info(f"📄 CSV de rechazos exportado: {saved_rejections_csv}")
+
+        # ── Auditoría Forense de Keypoints y Exportación CSV ──────────────────
+        audit_summary = self.keypoint_audit_logger.get_summary_report()
+        logger.info("\n" + audit_summary)
+        saved_keypoints_csv = self.keypoint_audit_logger.save_to_csv(actual_keypoints_csv)
+        logger.info(f"📊 CSV de auditoría de keypoints exportado: {saved_keypoints_csv}")
         logger.info("=" * 65)
 
         return all_events
@@ -626,6 +809,7 @@ def main():
     parser.add_argument("--csv",    "-c", default=settings.DEFAULT_OUTPUT_CSV,   help="CSV de eventos")
     parser.add_argument("--json",   "-j", default=None,                          help="JSON de tracking output")
     parser.add_argument("--rejections-csv", default=None,                        help="CSV para exportar rechazos de homografía")
+    parser.add_argument("--keypoints-csv",  default=None,                        help="CSV para exportar auditoría forense de keypoints")
     parser.add_argument("--env",    "-e", choices=["LOCAL", "KAGGLE"],           help="Forzar entorno")
     parser.add_argument("--headless", action="store_true", default=None,         help="Modo headless (Sin renderizar MP4/Overlays)")
     parser.add_argument("--max-frames", "-m", type=int, default=None,            help="Límite de frames")
@@ -640,6 +824,12 @@ def main():
                         help="Desactivar ThreadedOpenCVReader y usar cv2.VideoCapture secuencial")
     parser.add_argument("--reader-buffer", type=int, default=64,
                         help="Tamaño de buffer de frames para ThreadedOpenCVReader (default: 64)")
+    parser.add_argument("--player-stride", type=int, default=settings.PLAYER_INFERENCE_STRIDE,
+                        help="Cadencia de inferencia de jugadores (1=todos los frames, 2=skip adaptativo)")
+    parser.add_argument("--show-frame-num", action="store_true", default=None,
+                        help="Forzar visualización del número de frame junto a Field Coverage")
+    parser.add_argument("--hide-frame-num", action="store_true", default=False,
+                        help="Ocultar badge de número de frame")
     args = parser.parse_args()
 
     if args.env:
@@ -647,6 +837,8 @@ def main():
 
     if args.headless:
         os.environ["HEADLESS_MODE"] = "True"
+
+    show_frame = False if args.hide_frame_num else (True if args.show_frame_num else None)
 
     logger.info("=" * 65)
     logger.info("  ScoutingData v5.0 — Direct Inference Pipeline")
@@ -661,7 +853,11 @@ def main():
         enable_corner_shift=not args.disable_corner_shift,
         use_threaded_reader=not args.disable_threaded_reader,
         reader_buffer_size=args.reader_buffer,
+        player_stride=args.player_stride,
+        show_frame_number=show_frame,
     )
+
+
 
     resolved = settings.resolve_video_source(args.video)
     if resolved.exists():
@@ -674,6 +870,7 @@ def main():
             headless=args.headless,
             debug_homography=args.debug_homography,
             rejections_csv_path=args.rejections_csv,
+            keypoints_csv_path=args.keypoints_csv,
             use_threaded_reader=not args.disable_threaded_reader,
             reader_buffer_size=args.reader_buffer,
         )

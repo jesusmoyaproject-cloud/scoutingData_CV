@@ -7,7 +7,7 @@ OPT-6: Renders in-place (sin .copy() en cada función).
 
 import cv2
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple, Any
 from homography.mappings import KP_MAP
 from homography.estimator import filter_keypoints_by_pitch_side
 from config.field_points import FIELD_COORDS
@@ -183,6 +183,7 @@ def draw_calibration_overlay(
     hull_area_m2: Optional[float] = None,
     H: Optional[np.ndarray] = None,
     draw_residuals: bool = False,
+    frame_idx: Optional[int] = None,
 ) -> np.ndarray:
     """
     Dibuja keypoints detectados e instrumentación de diagnóstico.
@@ -192,6 +193,11 @@ def draw_calibration_overlay(
       - Línea residual amarilla con vector de error y etiqueta métrica (m y px).
     OPT-6: in-place.
     """
+    badge_x = 20
+    badge_y = 20
+    badge_h = 32
+    h_img, w_img = img.shape[:2]
+
     # ── Badge de Cobertura de Terreno (Field Coverage Ratio) ─────────────
     if field_coverage_ratio is not None and field_coverage_ratio > 0:
         pct_val = field_coverage_ratio * 100.0
@@ -200,10 +206,10 @@ def draw_calibration_overlay(
             pct_str += f" ({int(round(hull_area_m2))} m2)"
 
         (tw, th), _ = cv2.getTextSize(pct_str, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
-        bx, by = 20, 20
+        bx, by = badge_x, badge_y
         bw, bh = tw + 32, th + 16
+        badge_h = bh
 
-        h_img, w_img = img.shape[:2]
         if by + bh < h_img and bx + bw < w_img:
             sub = img[by:by+bh, bx:bx+bw]
             bg = np.zeros_like(sub)
@@ -215,6 +221,26 @@ def draw_calibration_overlay(
             cv2.circle(img, (bx + 12, by + bh//2), 4, dot_color, -1, cv2.LINE_AA)
             cv2.putText(img, pct_str, (bx + 22, by + bh - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+            badge_x = bx + bw + 10
+
+    # ── Badge de Número de Frame (al costado de Field Coverage en LOCAL) ──
+    if frame_idx is not None:
+        frame_str = f"Frame: {frame_idx}"
+        (ftw, fth), _ = cv2.getTextSize(frame_str, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+        fbx, fby = badge_x, badge_y
+        fbw, fbh = ftw + 32, badge_h
+
+        if fby + fbh < h_img and fbx + fbw < w_img:
+            sub = img[fby:fby+fbh, fbx:fbx+fbw]
+            bg = np.zeros_like(sub)
+            cv2.addWeighted(bg, 0.65, sub, 0.35, 0, sub)
+            img[fby:fby+fbh, fbx:fbx+fbw] = sub
+
+            cv2.rectangle(img, (fbx, fby), (fbx+fbw, fby+fbh), (60, 60, 60), 1, cv2.LINE_AA)
+            cv2.circle(img, (fbx + 12, fby + fbh//2), 4, (0, 220, 255), -1, cv2.LINE_AA)
+            cv2.putText(img, frame_str, (fbx + 22, fby + fbh - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+
 
     if (
         result is None
@@ -334,13 +360,56 @@ def draw_reprojection_residuals(
 
 def draw_player_detections(
     img: np.ndarray,
-    player_result,
+    player_result=None,
+    player_detections: Optional[List[dict]] = None,
     conf_threshold: float = 0.3,
     ellipse_color: tuple = (255, 0, 255),
     text_color: tuple = (255, 255, 255),
 ) -> np.ndarray:
-    """Dibuja jugadores detectados. OPT-6: in-place."""
-    if player_result.boxes is None or len(player_result.boxes) == 0:
+    """
+    Dibuja jugadores detectados. OPT-6: in-place.
+    Si se suministra `player_detections` enriquecido, utiliza los colores de equipo y rol calculados.
+    """
+    if player_detections is not None:
+        for p in player_detections:
+            conf = p.get("confidence", 1.0)
+            if conf < conf_threshold:
+                continue
+            bbox = p.get("bbox")
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = bbox
+            xc = int((x1 + x2) / 2)
+            yb = int(y2)
+            bw = int(x2 - x1)
+            aw = max(8, int(bw / 2.5))
+            ah = max(4, int(aw / 2.0))
+
+            # Color dinámico de equipo (BGR)
+            team_col = p.get("team_color", {})
+            p_color = tuple(team_col.get("bgr", ellipse_color)) if isinstance(team_col, dict) else ellipse_color
+
+            cv2.ellipse(img, (xc, yb), (aw, ah), 0, 0, 360, p_color, 2, cv2.LINE_AA)
+            cv2.circle(img, (xc, yb), 3, (0, 255, 255), -1, cv2.LINE_AA)
+
+            role = p.get("role", "player")
+            p_id = p.get("player_id", "?")
+            t_id = p.get("team_id", 0)
+            if role == "goalkeeper":
+                label = f"GK:{p_id} (T{t_id})"
+            elif role == "referee":
+                label = f"REF:{p_id}"
+            else:
+                label = f"ID:{p_id} (T{t_id})"
+
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+            cv2.rectangle(img, (xc - tw // 2 - 4, yb + 6), (xc + tw // 2 + 4, yb + 6 + th + 6), (0, 0, 0), -1)
+            cv2.rectangle(img, (xc - tw // 2 - 4, yb + 6), (xc + tw // 2 + 4, yb + 6 + th + 6), p_color, 1)
+            cv2.putText(img, label, (xc - tw // 2, yb + 6 + th + 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, text_color, 1, cv2.LINE_AA)
+        return img
+
+    if player_result is None or player_result.boxes is None or len(player_result.boxes) == 0:
         return img
     boxes     = player_result.boxes.xyxy.cpu().numpy()
     confs     = player_result.boxes.conf.cpu().numpy()
@@ -367,6 +436,7 @@ def draw_player_detections(
         cv2.putText(img, label, (xc-tw//2, yb+6+th+1),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1, cv2.LINE_AA)
     return img
+
 
 
 def draw_ball_detections(

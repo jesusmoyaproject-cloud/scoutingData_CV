@@ -109,7 +109,9 @@ DEFAULT_INPUT_VIDEO  = _resolve_default_input()
 DEFAULT_OUTPUT_VIDEO = str(OUTPUT_DIR / "scouting_output.mp4")
 DEFAULT_OUTPUT_CSV   = str(OUTPUT_DIR / "events_output.csv")
 DEFAULT_OUTPUT_JSON  = str(OUTPUT_DIR / f"tracking_{Path(DEFAULT_INPUT_VIDEO).stem}.json")
+DEFAULT_KEYPOINTS_CSV = str(OUTPUT_DIR / f"keypoints_audit_{Path(DEFAULT_INPUT_VIDEO).stem}.csv")
 # ─── Umbrales y Parámetros ───────────────────────────────────────────────────
+
 CONF_KEYPOINT       = float(os.getenv("CONF_KEYPOINT",       "0.35"))
 CONF_PLAYER         = float(os.getenv("CONF_PLAYER",         "0.4"))
 CONF_BALL           = float(os.getenv("CONF_BALL",           "0.4"))
@@ -118,6 +120,16 @@ MINIMAP_SCALE       = float(os.getenv("MINIMAP_SCALE",       "8.0"))
 HOMOGRAPHY_INTERVAL = int(os.getenv("HOMOGRAPHY_INTERVAL",   "1"))   # 1=cada frame, N>1=cada N frames
 DRAW_OUTLIERS       = os.getenv("DRAW_OUTLIERS", "false").lower() in ("true", "1", "yes")
 ENABLE_CORNER_SHIFT = os.getenv("ENABLE_CORNER_SHIFT", "true").lower() in ("true", "1", "yes")
+
+# ─── Configuración de Tracking y Equipos (BoTSORT / Team Classifier) ─────────
+TRACKER_CONFIG_PATH     = CONFIG_DIR / "botsort_sports.yaml"
+TRACKER_TYPE            = os.getenv("TRACKER_TYPE", "botsort")
+PLAYER_INFERENCE_STRIDE = int(os.getenv("PLAYER_INFERENCE_STRIDE", "1"))  # 1=todos los frames, 2=skip adaptativo
+PLAYER_NMS_IOU          = float(os.getenv("PLAYER_NMS_IOU", "0.45"))      # NMS IoU para evitar doble track en mismo jugador
+ENABLE_TEAM_CLASSIFIER  = os.getenv("ENABLE_TEAM_CLASSIFIER", "true").lower() in ("true", "1", "yes")
+SHOW_FRAME_NUMBER       = os.getenv("SHOW_FRAME_NUMBER", "true" if ENVIRONMENT == "LOCAL" else "false").lower() in ("true", "1", "yes")
+
+
 
 # ─── Utilidades ──────────────────────────────────────────────────────────────
 def resolve_video_source(source_input: str) -> Path:

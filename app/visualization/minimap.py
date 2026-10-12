@@ -6,7 +6,7 @@ OPT-5: get_cached_pitch_template() — renderiza el fondo de la cancha una sola 
 
 import cv2
 import numpy as np
-from typing import Optional
+from typing import Optional, List, Dict, Tuple, Any
 from config.field_dimensions import FieldDimensions
 from config.field_points import FIELD_COORDS
 from homography.mappings import KP_MAP
@@ -158,20 +158,46 @@ def draw_minimap_with_projections(
 
 def draw_player_projections_on_minimap(
     minimap_img: np.ndarray,
-    player_result,
-    H: np.ndarray,
+    player_result=None,
+    player_detections: Optional[List[dict]] = None,
+    H: Optional[np.ndarray] = None,
     conf_threshold: float = 0.3,
     dims: FieldDimensions = FieldDimensions(),
     scale: float = 8.0,
     padding_meters: float = 5.0,
     player_color: tuple = (255, 0, 255),
 ) -> np.ndarray:
-    """OPT-6: in-place sobre minimap_img."""
-    if player_result.boxes is None or len(player_result.boxes) == 0:
-        return minimap_img
+    """OPT-6: in-place sobre minimap_img con soporte para player_detections enriquecidos."""
     pad_px = int(padding_meters * scale)
+
     def f2px(x_m, y_m):
         return (int(x_m * scale) + pad_px, int(y_m * scale) + pad_px)
+
+    if player_detections is not None:
+        for p in player_detections:
+            fx = p.get("pitch_x_m")
+            fy = p.get("pitch_y_m")
+            if fx is None or fy is None:
+                continue
+            if not (-5 <= fx <= dims.length + 5 and -5 <= fy <= dims.width + 5):
+                continue
+            px_x, px_y = f2px(fx, fy)
+
+            team_col = p.get("team_color", {})
+            col = tuple(team_col.get("bgr", player_color)) if isinstance(team_col, dict) else player_color
+
+            role = p.get("role", "player")
+            p_id = p.get("player_id", "")
+            lbl = f"GK{p_id}" if role == "goalkeeper" else (f"R{p_id}" if role == "referee" else f"P{p_id}")
+
+            cv2.circle(minimap_img, (px_x, px_y), 7, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.circle(minimap_img, (px_x, px_y), 5, col, -1, cv2.LINE_AA)
+            cv2.putText(minimap_img, lbl, (px_x + 8, px_y + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        return minimap_img
+
+    if player_result is None or player_result.boxes is None or len(player_result.boxes) == 0 or H is None:
+        return minimap_img
 
     boxes     = player_result.boxes.xyxy.cpu().numpy()
     confs     = player_result.boxes.conf.cpu().numpy()
@@ -183,18 +209,19 @@ def draw_player_projections_on_minimap(
         if conf < conf_threshold:
             continue
         player_id = track_ids[idx] if track_ids is not None else idx
-        x1,y1,x2,y2 = box
-        xc = float((x1+x2)/2)
+        x1, y1, x2, y2 = box
+        xc = float((x1 + x2) / 2)
         yb = float(y2)
         fx, fy = pixel_to_field(xc, yb, H)
-        if not (-5 <= fx <= dims.length+5 and -5 <= fy <= dims.width+5):
+        if not (-5 <= fx <= dims.length + 5 and -5 <= fy <= dims.width + 5):
             continue
         px_x, px_y = f2px(fx, fy)
-        cv2.circle(minimap_img, (px_x, px_y), 8, (255,255,255), 1, cv2.LINE_AA)
+        cv2.circle(minimap_img, (px_x, px_y), 8, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.circle(minimap_img, (px_x, px_y), 5, player_color, -1, cv2.LINE_AA)
-        cv2.putText(minimap_img, f"P{player_id}", (px_x+8, px_y+4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1, cv2.LINE_AA)
+        cv2.putText(minimap_img, f"P{player_id}", (px_x + 8, px_y + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
     return minimap_img
+
 
 
 def draw_ball_projection_on_minimap(

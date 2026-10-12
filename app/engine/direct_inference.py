@@ -90,28 +90,46 @@ class DirectInferenceEngine:
             save=False,
         )[0]
 
-    def infer_players(self, frame_bgr, conf: float = 0.35, is_video: bool = True):
-        """Retorna resultado de player tracking compatible con MockPlayerResult."""
+    def infer_players(self, frame_bgr, conf: float = 0.35, is_video: bool = True, iou: Optional[float] = None):
+        """Retorna resultado de player tracking con BoTSORT."""
+        nms_iou = iou if iou is not None else getattr(settings, "PLAYER_NMS_IOU", 0.45)
         if is_video:
+            tracker_cfg = str(settings.TRACKER_CONFIG_PATH) if hasattr(settings, "TRACKER_CONFIG_PATH") and Path(settings.TRACKER_CONFIG_PATH).exists() else "botsort.yaml"
             try:
                 return self.player_model.track(
                     source=frame_bgr,
                     conf=conf,
+                    iou=nms_iou,
                     device=self.device,
                     persist=True,
-                    tracker="bytetrack.yaml",
+                    tracker=tracker_cfg,
                     verbose=False,
                     save=False,
                 )[0]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[DirectInferenceEngine] Fallback en track({tracker_cfg}): {e}, intentando botsort.yaml...")
+                try:
+                    return self.player_model.track(
+                        source=frame_bgr,
+                        conf=conf,
+                        iou=nms_iou,
+                        device=self.device,
+                        persist=True,
+                        tracker="botsort.yaml",
+                        verbose=False,
+                        save=False,
+                    )[0]
+                except Exception:
+                    pass
         return self.player_model.predict(
             source=frame_bgr,
             conf=conf,
+            iou=nms_iou,
             device=self.device,
             verbose=False,
             save=False,
         )[0]
+
 
     def infer_ball(self, frame_bgr, conf: float = 0.15):
         """Retorna resultado de detección de balón."""
@@ -130,6 +148,7 @@ class DirectInferenceEngine:
         conf_player: float = 0.35,
         conf_ball: float = 0.15,
         is_video: bool = True,
+        iou_player: Optional[float] = None,
     ) -> Tuple:
         """
         Inferencia de los 3 modelos de forma secuencial con profiling de tiempos.
@@ -140,7 +159,7 @@ class DirectInferenceEngine:
         kp_result = self.infer_keypoints(frame_bgr, conf=conf_kp)
         t1 = time.perf_counter()
 
-        player_result = self.infer_players(frame_bgr, conf=conf_player, is_video=is_video)
+        player_result = self.infer_players(frame_bgr, conf=conf_player, is_video=is_video, iou=iou_player)
         t2 = time.perf_counter()
 
         ball_result = self.infer_ball(frame_bgr, conf=conf_ball)
