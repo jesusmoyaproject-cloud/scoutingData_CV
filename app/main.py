@@ -221,6 +221,7 @@ class SoccerAnalysisV5:
         self._cached_hull_m2: float = 0.0
 
         # Registrador forense y auditoría punto a punto de keypoints (Local y Nube)
+        self.enable_keypoint_audit: bool = False
         self.keypoint_audit_logger = KeypointAuditLogger()
 
 
@@ -347,21 +348,22 @@ class SoccerAnalysisV5:
                 )
 
         # ── 3.1 Registrar auditoría forense punto a punto de keypoints ──
-        h_img, w_img = frame_bgr.shape[:2]
-        self.keypoint_audit_logger.log_frame(
-            frame_idx=frame_idx,
-            timestamp_sec=timestamp_sec,
-            kp_result=kp_result,
-            homography_status=status,
-            H_effective=self._cached_H,
-            H_candidate=H_cand,
-            residuals=cand_residuals,
-            compute_error_reason=cand_reject_reason,
-            compute_error_details=cand_details,
-            conf_threshold=self.conf_keypoint,
-            img_width=w_img,
-            img_height=h_img,
-        )
+        if self.enable_keypoint_audit:
+            h_img, w_img = frame_bgr.shape[:2]
+            self.keypoint_audit_logger.log_frame(
+                frame_idx=frame_idx,
+                timestamp_sec=timestamp_sec,
+                kp_result=kp_result,
+                homography_status=status,
+                H_effective=self._cached_H,
+                H_candidate=H_cand,
+                residuals=cand_residuals,
+                compute_error_reason=cand_reject_reason,
+                compute_error_details=cand_details,
+                conf_threshold=self.conf_keypoint,
+                img_width=w_img,
+                img_height=h_img,
+            )
 
         H    = self._cached_H
         mask = self._cached_mask
@@ -549,8 +551,10 @@ class SoccerAnalysisV5:
         actual_rejections_csv = rejections_csv_path or str(settings.OUTPUT_DIR / f"rejections_{resolved.stem}.csv")
         self.homography_tracker.csv_path = actual_rejections_csv
 
-        actual_keypoints_csv = keypoints_csv_path or str(settings.OUTPUT_DIR / f"keypoints_audit_{resolved.stem}.csv")
-        self.keypoint_audit_logger = KeypointAuditLogger(output_csv_path=actual_keypoints_csv)
+        self.enable_keypoint_audit = (keypoints_csv_path is not None) or debug_homography
+        actual_keypoints_csv = keypoints_csv_path or (str(settings.OUTPUT_DIR / f"keypoints_audit_{resolved.stem}.csv") if self.enable_keypoint_audit else None)
+        if self.enable_keypoint_audit:
+            self.keypoint_audit_logger = KeypointAuditLogger(output_csv_path=actual_keypoints_csv)
 
         # OPT-9: ThreadedOpenCVReader (prefetching asíncrono + profiling)
         if use_reader:
@@ -790,10 +794,11 @@ class SoccerAnalysisV5:
         logger.info(f"📄 CSV de rechazos exportado: {saved_rejections_csv}")
 
         # ── Auditoría Forense de Keypoints y Exportación CSV ──────────────────
-        audit_summary = self.keypoint_audit_logger.get_summary_report()
-        logger.info("\n" + audit_summary)
-        saved_keypoints_csv = self.keypoint_audit_logger.save_to_csv(actual_keypoints_csv)
-        logger.info(f"📊 CSV de auditoría de keypoints exportado: {saved_keypoints_csv}")
+        if getattr(self, "enable_keypoint_audit", False):
+            audit_summary = self.keypoint_audit_logger.get_summary_report()
+            logger.info("\n" + audit_summary)
+            saved_keypoints_csv = self.keypoint_audit_logger.save_to_csv(actual_keypoints_csv)
+            logger.info(f"📊 CSV de auditoría de keypoints exportado: {saved_keypoints_csv}")
         logger.info("=" * 65)
 
         return all_events
@@ -834,9 +839,17 @@ def main():
 
     if args.env:
         os.environ["ENVIRONMENT"] = args.env
+        settings.ENVIRONMENT = args.env
+        if args.env == "KAGGLE" and settings.CUDA_AVAILABLE:
+            settings.MODEL_FORMAT = "pt"
+            settings.INFERENCE_DEVICE = "cuda"
+        elif args.env == "LOCAL":
+            settings.MODEL_FORMAT = "openvino"
+            settings.INFERENCE_DEVICE = "cpu"
 
     if args.headless:
         os.environ["HEADLESS_MODE"] = "True"
+        settings.HEADLESS_MODE = True
 
     show_frame = False if args.hide_frame_num else (True if args.show_frame_num else None)
 

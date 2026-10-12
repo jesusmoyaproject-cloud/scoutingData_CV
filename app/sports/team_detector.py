@@ -329,10 +329,14 @@ class TeamDetector:
 
             track_id = p.get("player_id")
 
-            # Muestreo adaptativo: Si el jugador ya tiene historial estable, actualizar cada sample_interval frames
-            has_history = track_id is not None and len(self._track_history.get(track_id, [])) >= 10
+            # Muestreo adaptativo: Si el jugador ya tiene historial o está bloqueado, evitar crop redundante
+            is_locked = track_id is not None and track_id in self._locked_teams
+            has_history = track_id is not None and len(self._track_history.get(track_id, [])) >= 5
             is_cached = track_id is not None and track_id in self._cached_classifications
-            skip_sampling = has_history and is_cached and (frame_idx % self.sample_interval != 0)
+            skip_sampling = is_cached and (
+                (is_locked and frame_idx % 15 != 0)
+                or (has_history and frame_idx % self.sample_interval != 0)
+            )
 
             if skip_sampling:
                 classification = self._cached_classifications[track_id]
