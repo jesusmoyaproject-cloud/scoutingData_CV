@@ -351,7 +351,7 @@ class TemporalHomographyTracker:
             ])
 
         lines.append("---------------------")
-        logger.warning("\n".join(lines))
+        logger.debug("\n".join(lines))
 
     def _record_rejection(
         self,

@@ -37,7 +37,6 @@ from engine.threaded_reader import ThreadedOpenCVReader
 from homography.estimator import compute_homography
 from homography.temporal_validator import TemporalHomographyTracker
 from homography.transforms import pixel_to_field
-from homography.keypoint_audit_logger import KeypointAuditLogger
 from homography.diagnostics_tool import (
     generate_residuals_table,
     run_leave_one_out_analysis,
@@ -220,10 +219,6 @@ class SoccerAnalysisV5:
         self._cached_field_coverage_ratio: float = 0.0
         self._cached_hull_m2: float = 0.0
 
-        # Registrador forense y auditoría punto a punto de keypoints (Local y Nube)
-        self.enable_keypoint_audit: bool = False
-        self.keypoint_audit_logger = KeypointAuditLogger()
-
 
     def process_frame(
         self,
@@ -346,24 +341,6 @@ class SoccerAnalysisV5:
                 homography_logger.debug(
                     f"[Frame {frame_idx}] ⚠ H {status} (streak={self._h_reject_streak}) — manteniendo previa"
                 )
-
-        # ── 3.1 Registrar auditoría forense punto a punto de keypoints ──
-        if self.enable_keypoint_audit:
-            h_img, w_img = frame_bgr.shape[:2]
-            self.keypoint_audit_logger.log_frame(
-                frame_idx=frame_idx,
-                timestamp_sec=timestamp_sec,
-                kp_result=kp_result,
-                homography_status=status,
-                H_effective=self._cached_H,
-                H_candidate=H_cand,
-                residuals=cand_residuals,
-                compute_error_reason=cand_reject_reason,
-                compute_error_details=cand_details,
-                conf_threshold=self.conf_keypoint,
-                img_width=w_img,
-                img_height=h_img,
-            )
 
         H    = self._cached_H
         mask = self._cached_mask
@@ -547,14 +524,9 @@ class SoccerAnalysisV5:
         if not resolved.exists():
             raise FileNotFoundError(f"Video no encontrado: {resolved}")
 
-        # Configurar destino de CSV para rechazos de homografía y auditoría de keypoints
+        # Configurar destino de CSV para rechazos de homografía
         actual_rejections_csv = rejections_csv_path or str(settings.OUTPUT_DIR / f"rejections_{resolved.stem}.csv")
         self.homography_tracker.csv_path = actual_rejections_csv
-
-        self.enable_keypoint_audit = (keypoints_csv_path is not None) or debug_homography
-        actual_keypoints_csv = keypoints_csv_path or (str(settings.OUTPUT_DIR / f"keypoints_audit_{resolved.stem}.csv") if self.enable_keypoint_audit else None)
-        if self.enable_keypoint_audit:
-            self.keypoint_audit_logger = KeypointAuditLogger(output_csv_path=actual_keypoints_csv)
 
         # OPT-9: ThreadedOpenCVReader (prefetching asíncrono + profiling)
         if use_reader:
@@ -724,7 +696,6 @@ class SoccerAnalysisV5:
                     "read_and_decode_sec": round(total_read_decode_time, 4),
                     "reader_metrics": reader.get_metrics() if hasattr(reader, "get_metrics") else None,
                 },
-                "keypoints_audit_csv": actual_keypoints_csv,
                 "rejections_csv": actual_rejections_csv,
             },
             "frames": tracking_frames,
@@ -793,12 +764,6 @@ class SoccerAnalysisV5:
         saved_rejections_csv = self.homography_tracker.save_rejections_to_csv(actual_rejections_csv)
         logger.info(f"📄 CSV de rechazos exportado: {saved_rejections_csv}")
 
-        # ── Auditoría Forense de Keypoints y Exportación CSV ──────────────────
-        if getattr(self, "enable_keypoint_audit", False):
-            audit_summary = self.keypoint_audit_logger.get_summary_report()
-            logger.info("\n" + audit_summary)
-            saved_keypoints_csv = self.keypoint_audit_logger.save_to_csv(actual_keypoints_csv)
-            logger.info(f"📊 CSV de auditoría de keypoints exportado: {saved_keypoints_csv}")
         logger.info("=" * 65)
 
         return all_events
