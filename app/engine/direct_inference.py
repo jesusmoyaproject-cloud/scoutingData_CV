@@ -63,6 +63,12 @@ class DirectInferenceEngine:
                 self.keypoint_model.to("cuda")
                 self.player_model.to("cuda")
                 self.ball_model.to("cuda")
+                if hasattr(self.keypoint_model.model, "half"):
+                    self.keypoint_model.model.half()
+                if hasattr(self.player_model.model, "half"):
+                    self.player_model.model.half()
+                if hasattr(self.ball_model.model, "half"):
+                    self.ball_model.model.half()
             except Exception as e:
                 logger.warning(f"  [Engine] No se pudo mover explícitamente a CUDA: {e}")
 
@@ -91,12 +97,10 @@ class DirectInferenceEngine:
 
     def infer_keypoints(self, frame_bgr, conf: float = 0.25):
         """Retorna resultado de keypoints compatible con MockKeypointResult."""
-        use_half = (self.device == "cuda" and self.format == "pt")
         return self.keypoint_model.predict(
             source=frame_bgr,
             conf=conf,
             device=self.device,
-            half=use_half,
             verbose=False,
             save=False,
         )[0]
@@ -104,7 +108,6 @@ class DirectInferenceEngine:
     def infer_players(self, frame_bgr, conf: float = 0.35, is_video: bool = True, iou: Optional[float] = None):
         """Retorna resultado de player tracking con BoTSORT."""
         nms_iou = iou if iou is not None else getattr(settings, "PLAYER_NMS_IOU", 0.45)
-        use_half = (self.device == "cuda" and self.format == "pt")
         if is_video:
             tracker_cfg = str(settings.TRACKER_CONFIG_PATH) if hasattr(settings, "TRACKER_CONFIG_PATH") and Path(settings.TRACKER_CONFIG_PATH).exists() else "botsort.yaml"
             try:
@@ -113,7 +116,6 @@ class DirectInferenceEngine:
                     conf=conf,
                     iou=nms_iou,
                     device=self.device,
-                    half=use_half,
                     persist=True,
                     tracker=tracker_cfg,
                     verbose=False,
@@ -127,7 +129,6 @@ class DirectInferenceEngine:
                         conf=conf,
                         iou=nms_iou,
                         device=self.device,
-                        half=use_half,
                         persist=True,
                         tracker="botsort.yaml",
                         verbose=False,
@@ -140,7 +141,6 @@ class DirectInferenceEngine:
             conf=conf,
             iou=nms_iou,
             device=self.device,
-            half=use_half,
             verbose=False,
             save=False,
         )[0]
@@ -148,12 +148,10 @@ class DirectInferenceEngine:
 
     def infer_ball(self, frame_bgr, conf: float = 0.15):
         """Retorna resultado de detección de balón."""
-        use_half = (self.device == "cuda" and self.format == "pt")
         return self.ball_model.predict(
             source=frame_bgr,
             conf=conf,
             device=self.device,
-            half=use_half,
             verbose=False,
             save=False,
         )[0]
