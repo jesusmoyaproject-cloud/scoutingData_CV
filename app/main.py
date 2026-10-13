@@ -609,7 +609,7 @@ class SoccerAnalysisV5:
                             "player_id": p["player_id"],
                             "role": p.get("role", "player"),
                             "team_id": p.get("team_id", 0),
-                            "team_color": p.get("team_color", {}),
+                            "team_color": p.get("team_color", {}).get("hex", "#FFFFFF") if isinstance(p.get("team_color"), dict) else p.get("team_color", "#FFFFFF"),
                             "team_confidence": p.get("team_confidence", 1.0),
                             "tracking_confidence": p.get("confidence", 1.0),
                             "is_interpolated": p.get("is_interpolated", False),
@@ -780,7 +780,7 @@ def main():
     parser.add_argument("--json",   "-j", default=None,                          help="JSON de tracking output")
     parser.add_argument("--rejections-csv", default=None,                        help="CSV para exportar rechazos de homografía")
     parser.add_argument("--keypoints-csv",  default=None,                        help="CSV para exportar auditoría forense de keypoints")
-    parser.add_argument("--env",    "-e", choices=["LOCAL", "KAGGLE"],           help="Forzar entorno")
+    parser.add_argument("--env",    "-e", choices=["LOCAL", "KAGGLE", "COLAB"],           help="Forzar entorno (LOCAL, KAGGLE, COLAB)")
     parser.add_argument("--headless", action="store_true", default=None,         help="Modo headless (Sin renderizar MP4/Overlays)")
     parser.add_argument("--max-frames", "-m", type=int, default=None,            help="Límite de frames")
     parser.add_argument("--homography-interval", type=int,
@@ -803,14 +803,24 @@ def main():
     args = parser.parse_args()
 
     if args.env:
-        os.environ["ENVIRONMENT"] = args.env
-        settings.ENVIRONMENT = args.env
-        if args.env == "KAGGLE" and settings.CUDA_AVAILABLE:
-            settings.MODEL_FORMAT = "pt"
-            settings.INFERENCE_DEVICE = "cuda"
-        elif args.env == "LOCAL":
+        env_upper = args.env.upper()
+        os.environ["ENVIRONMENT"] = env_upper
+        settings.ENVIRONMENT = env_upper
+        if env_upper in ("KAGGLE", "COLAB"):
+            if settings.CUDA_AVAILABLE:
+                settings.MODEL_FORMAT = "pt"
+                settings.INFERENCE_DEVICE = "cuda"
+            else:
+                logger.warning(
+                    f"⚠ Entorno {env_upper} seleccionado pero CUDA no está disponible en esta sesión. "
+                    f"En Colab: Ve a 'Entorno de ejecución' -> 'Cambiar tipo de entorno de ejecución' -> Selecciona GPU (L4 o T4)."
+                )
+                settings.MODEL_FORMAT = "openvino" if Path(settings.MODEL_KEYPOINT_PATH).exists() else "pt"
+                settings.INFERENCE_DEVICE = "cpu"
+        elif env_upper == "LOCAL":
             settings.MODEL_FORMAT = "openvino"
             settings.INFERENCE_DEVICE = "cpu"
+        settings.configure_gpu_optimizations()
 
     if args.headless:
         os.environ["HEADLESS_MODE"] = "True"

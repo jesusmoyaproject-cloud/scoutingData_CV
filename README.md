@@ -106,7 +106,23 @@ python app/main.py --video data/input.mp4 --headless --json outputs/tracking.jso
 
 ---
 
-### 3. Ejecución en Kaggle (GPU Tesla T4)
+### 3. Ejecución en Google Colab (GPU NVIDIA L4 / T4)
+
+En una celda de Google Colab:
+```bash
+# 1. Entrar a la carpeta del repositorio clonado
+%cd /content/scoutingData_CV
+
+# 2. Instalar dependencias
+!pip install -r requirements.txt
+
+# 3. Ejecutar con aceleración GPU L4 (Tensor Cores TF32 + FP16)
+!python colab_runner.py --video /content/garVScc_liga1max_2026_apertura_pt.mp4
+```
+
+---
+
+### 4. Ejecución en Kaggle (GPU Tesla T4)
 
 ```bash
 python kaggle_runner.py --video /kaggle/input/soccer-match/input.mp4 --output /kaggle/working/outputs/salida.mp4 --json /kaggle/working/outputs/tracking.json

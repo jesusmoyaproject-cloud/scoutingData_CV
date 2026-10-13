@@ -20,11 +20,17 @@ class DirectInferenceEngine:
     def __init__(self):
         self.device = settings.INFERENCE_DEVICE
         self.format = settings.MODEL_FORMAT
+        self.use_half = (self.device == "cuda")
+
+        gpu_name = getattr(settings, "GPU_DEVICE_NAME", "")
+        is_l4 = getattr(settings, "GPU_IS_L4", False)
+        gpu_str = f", GPU={gpu_name} (L4={is_l4})" if gpu_name else ""
 
         logger.info(
             f"[Engine] Inicializando DirectInferenceEngine — "
             f"format={self.format}, device={self.device}, "
-            f"CUDA={settings.CUDA_AVAILABLE}"
+            f"CUDA={settings.CUDA_AVAILABLE}{gpu_str}, "
+            f"FP16={self.use_half}"
         )
 
         if self.format == "pt":
@@ -37,7 +43,7 @@ class DirectInferenceEngine:
     # ── Loaders ──────────────────────────────────────────────────────────────
 
     def _load_pt_models(self):
-        """Carga modelos .pt originales para inferencia CUDA (Kaggle T4)."""
+        """Carga modelos .pt originales para inferencia CUDA (Colab L4 / Kaggle T4)."""
         kp_path  = settings.MODEL_KEYPOINT_PT_PATH
         pl_path  = settings.MODEL_PLAYER_PT_PATH
         ba_path  = settings.MODEL_BALL_PT_PATH
@@ -45,8 +51,8 @@ class DirectInferenceEngine:
         for label, path in [("Keypoint", kp_path), ("Player", pl_path), ("Ball", ba_path)]:
             if not Path(path).exists():
                 raise FileNotFoundError(
-                    f"Modelo .pt '{label}' no encontrado: {path}. "
-                    f"Coloca los .pt en app/model/modeloOriginal/"
+                    f"Modelo .pt '{label}' no encontrado en: {path}. "
+                    f"Coloca los .pt en app/model/modeloOriginal/ o define MODEL_{label.upper()}_PT_PATH"
                 )
 
         logger.info(f"  Keypoint .pt : {kp_path}")
@@ -58,19 +64,14 @@ class DirectInferenceEngine:
         self.ball_model     = YOLO(str(ba_path))
 
         if self.device == "cuda":
-            logger.info("  [Engine] ⚡ Moviendo modelos PyTorch a GPU CUDA...")
+            gpu_name = getattr(settings, "GPU_DEVICE_NAME", "CUDA")
+            logger.info(f"  [Engine] ⚡ Modelos preparados para aceleración en {gpu_name} (FP16={self.use_half})...")
             try:
                 self.keypoint_model.to("cuda")
                 self.player_model.to("cuda")
                 self.ball_model.to("cuda")
-                if hasattr(self.keypoint_model.model, "half"):
-                    self.keypoint_model.model.half()
-                if hasattr(self.player_model.model, "half"):
-                    self.player_model.model.half()
-                if hasattr(self.ball_model.model, "half"):
-                    self.ball_model.model.half()
             except Exception as e:
-                logger.warning(f"  [Engine] No se pudo mover explícitamente a CUDA: {e}")
+                logger.warning(f"  [Engine] Advertencia al mover modelos a CUDA: {e}")
 
     def _load_openvino_models(self):
         """Carga modelos OpenVINO IR para inferencia CPU Intel (Local)."""
@@ -101,6 +102,7 @@ class DirectInferenceEngine:
             source=frame_bgr,
             conf=conf,
             device=self.device,
+            half=self.use_half,
             verbose=False,
             save=False,
         )[0]
@@ -116,6 +118,7 @@ class DirectInferenceEngine:
                     conf=conf,
                     iou=nms_iou,
                     device=self.device,
+                    half=self.use_half,
                     persist=True,
                     tracker=tracker_cfg,
                     verbose=False,
@@ -129,6 +132,7 @@ class DirectInferenceEngine:
                         conf=conf,
                         iou=nms_iou,
                         device=self.device,
+                        half=self.use_half,
                         persist=True,
                         tracker="botsort.yaml",
                         verbose=False,
@@ -141,6 +145,7 @@ class DirectInferenceEngine:
             conf=conf,
             iou=nms_iou,
             device=self.device,
+            half=self.use_half,
             verbose=False,
             save=False,
         )[0]
@@ -152,6 +157,7 @@ class DirectInferenceEngine:
             source=frame_bgr,
             conf=conf,
             device=self.device,
+            half=self.use_half,
             verbose=False,
             save=False,
         )[0]

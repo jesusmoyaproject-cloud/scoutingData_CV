@@ -379,23 +379,35 @@ class TeamDetector:
 
     def get_teams_metadata(self) -> Dict[str, Any]:
         """Retorna diccionario estructurado con los equipos detectados para metadata JSON."""
+        c0 = self.team_colors_bgr.get(0, (0, 0, 255))
+        c1 = self.team_colors_bgr.get(1, (255, 255, 255))
+        cr = self.team_colors_bgr.get(-1, (40, 40, 40))
         return {
             "0": {
                 "name": "Team A",
-                "primary_color_bgr": list(self.team_colors_bgr.get(0, (0, 0, 255))),
                 "primary_color_hex": self.team_colors_hex.get(0, "#FF0000"),
+                "primary_color_rgb": [int(c0[2]), int(c0[1]), int(c0[0])],
+                "primary_color_bgr": list(c0),
                 "role_name": "outfield",
+                "real_team_id": None,
+                "real_team_name": None,
             },
             "1": {
                 "name": "Team B",
-                "primary_color_bgr": list(self.team_colors_bgr.get(1, (255, 255, 255))),
                 "primary_color_hex": self.team_colors_hex.get(1, "#FFFFFF"),
+                "primary_color_rgb": [int(c1[2]), int(c1[1]), int(c1[0])],
+                "primary_color_bgr": list(c1),
                 "role_name": "outfield",
+                "real_team_id": None,
+                "real_team_name": None,
             },
             "-1": {
                 "name": "Referees",
-                "primary_color_bgr": list(self.team_colors_bgr.get(-1, (40, 40, 40))),
                 "primary_color_hex": self.team_colors_hex.get(-1, "#282828"),
+                "primary_color_rgb": [int(cr[2]), int(cr[1]), int(cr[0])],
+                "primary_color_bgr": list(cr),
                 "role_name": "referee",
+                "real_team_id": None,
+                "real_team_name": "Árbitros",
             },
         }
