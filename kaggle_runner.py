@@ -22,6 +22,10 @@ sys.path.insert(0, str(APP_DIR))
 import warnings
 warnings.filterwarnings("ignore", message=".*'half' is deprecated.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Silenciar warnings y deprecaciones del logger interno de Ultralytics
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
 from config import settings
 

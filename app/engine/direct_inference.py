@@ -9,6 +9,10 @@ from config import settings
 
 warnings.filterwarnings("ignore", message=".*'half' is deprecated.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Silenciar warnings y deprecaciones del logger interno de Ultralytics
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
 logger = logging.getLogger("DirectInferenceEngine")
 perf_logger = logging.getLogger("DirectInferenceEngine.perf")
@@ -106,64 +110,64 @@ class DirectInferenceEngine:
 
     def infer_keypoints(self, frame_bgr, conf: float = 0.25):
         """Retorna resultado de keypoints compatible con MockKeypointResult."""
-        pred_kwargs = {
-            "source": frame_bgr,
-            "conf": conf,
-            "device": self.device,
-            "verbose": False,
-            "save": False,
-        }
-        if self.use_half and self.format == "pt":
-            pred_kwargs["half"] = True
-        return self.keypoint_model.predict(**pred_kwargs)[0]
+        return self.keypoint_model.predict(
+            source=frame_bgr,
+            conf=conf,
+            device=self.device,
+            verbose=False,
+            save=False,
+        )[0]
 
     def infer_players(self, frame_bgr, conf: float = 0.35, is_video: bool = True, iou: Optional[float] = None):
         """Retorna resultado de player tracking con BoTSORT."""
         nms_iou = iou if iou is not None else getattr(settings, "PLAYER_NMS_IOU", 0.45)
-        pred_kwargs = {
-            "source": frame_bgr,
-            "conf": conf,
-            "iou": nms_iou,
-            "device": self.device,
-            "verbose": False,
-            "save": False,
-        }
-        if self.use_half and self.format == "pt":
-            pred_kwargs["half"] = True
-
         if is_video:
             tracker_cfg = str(settings.TRACKER_CONFIG_PATH) if hasattr(settings, "TRACKER_CONFIG_PATH") and Path(settings.TRACKER_CONFIG_PATH).exists() else "botsort.yaml"
             try:
                 return self.player_model.track(
+                    source=frame_bgr,
+                    conf=conf,
+                    iou=nms_iou,
+                    device=self.device,
                     persist=True,
                     tracker=tracker_cfg,
-                    **pred_kwargs,
+                    verbose=False,
+                    save=False,
                 )[0]
             except Exception as e:
                 logger.warning(f"[DirectInferenceEngine] Fallback en track({tracker_cfg}): {e}, intentando botsort.yaml...")
                 try:
                     return self.player_model.track(
+                        source=frame_bgr,
+                        conf=conf,
+                        iou=nms_iou,
+                        device=self.device,
                         persist=True,
                         tracker="botsort.yaml",
-                        **pred_kwargs,
+                        verbose=False,
+                        save=False,
                     )[0]
                 except Exception:
                     pass
-        return self.player_model.predict(**pred_kwargs)[0]
+        return self.player_model.predict(
+            source=frame_bgr,
+            conf=conf,
+            iou=nms_iou,
+            device=self.device,
+            verbose=False,
+            save=False,
+        )[0]
 
 
     def infer_ball(self, frame_bgr, conf: float = 0.15):
         """Retorna resultado de detección de balón."""
-        pred_kwargs = {
-            "source": frame_bgr,
-            "conf": conf,
-            "device": self.device,
-            "verbose": False,
-            "save": False,
-        }
-        if self.use_half and self.format == "pt":
-            pred_kwargs["half"] = True
-        return self.ball_model.predict(**pred_kwargs)[0]
+        return self.ball_model.predict(
+            source=frame_bgr,
+            conf=conf,
+            device=self.device,
+            verbose=False,
+            save=False,
+        )[0]
 
     def infer(
         self,

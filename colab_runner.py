@@ -27,6 +27,10 @@ os.environ["HEADLESS_MODE"] = "True"
 import warnings
 warnings.filterwarnings("ignore", message=".*'half' is deprecated.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Silenciar warnings y deprecaciones del logger interno de Ultralytics
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
 import torch
 from config import settings

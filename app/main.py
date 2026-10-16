@@ -67,6 +67,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SoccerAnalysisV5")
 
+# Silenciar warnings y deprecaciones del logger interno de Ultralytics
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
+
 # Logger de timing de inferencia — desactivado por defecto, se activa con --debug-homography
 perf_logger = logging.getLogger("DirectInferenceEngine.perf")
 perf_logger.setLevel(logging.WARNING)  # Silencioso por defecto
