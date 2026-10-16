@@ -74,6 +74,10 @@ class DirectInferenceEngine:
                 self.keypoint_model.to("cuda")
                 self.player_model.to("cuda")
                 self.ball_model.to("cuda")
+                if self.use_half:
+                    self.keypoint_model.model.half()
+                    self.player_model.model.half()
+                    self.ball_model.model.half()
             except Exception as e:
                 logger.warning(f"  [Engine] Advertencia al mover modelos a CUDA: {e}")
 
@@ -102,64 +106,64 @@ class DirectInferenceEngine:
 
     def infer_keypoints(self, frame_bgr, conf: float = 0.25):
         """Retorna resultado de keypoints compatible con MockKeypointResult."""
-        return self.keypoint_model.predict(
-            source=frame_bgr,
-            conf=conf,
-            device=self.device,
-            verbose=False,
-            save=False,
-        )[0]
+        pred_kwargs = {
+            "source": frame_bgr,
+            "conf": conf,
+            "device": self.device,
+            "verbose": False,
+            "save": False,
+        }
+        if self.use_half and self.format == "pt":
+            pred_kwargs["half"] = True
+        return self.keypoint_model.predict(**pred_kwargs)[0]
 
     def infer_players(self, frame_bgr, conf: float = 0.35, is_video: bool = True, iou: Optional[float] = None):
         """Retorna resultado de player tracking con BoTSORT."""
         nms_iou = iou if iou is not None else getattr(settings, "PLAYER_NMS_IOU", 0.45)
+        pred_kwargs = {
+            "source": frame_bgr,
+            "conf": conf,
+            "iou": nms_iou,
+            "device": self.device,
+            "verbose": False,
+            "save": False,
+        }
+        if self.use_half and self.format == "pt":
+            pred_kwargs["half"] = True
+
         if is_video:
             tracker_cfg = str(settings.TRACKER_CONFIG_PATH) if hasattr(settings, "TRACKER_CONFIG_PATH") and Path(settings.TRACKER_CONFIG_PATH).exists() else "botsort.yaml"
             try:
                 return self.player_model.track(
-                    source=frame_bgr,
-                    conf=conf,
-                    iou=nms_iou,
-                    device=self.device,
                     persist=True,
                     tracker=tracker_cfg,
-                    verbose=False,
-                    save=False,
+                    **pred_kwargs,
                 )[0]
             except Exception as e:
                 logger.warning(f"[DirectInferenceEngine] Fallback en track({tracker_cfg}): {e}, intentando botsort.yaml...")
                 try:
                     return self.player_model.track(
-                        source=frame_bgr,
-                        conf=conf,
-                        iou=nms_iou,
-                        device=self.device,
                         persist=True,
                         tracker="botsort.yaml",
-                        verbose=False,
-                        save=False,
+                        **pred_kwargs,
                     )[0]
                 except Exception:
                     pass
-        return self.player_model.predict(
-            source=frame_bgr,
-            conf=conf,
-            iou=nms_iou,
-            device=self.device,
-            verbose=False,
-            save=False,
-        )[0]
+        return self.player_model.predict(**pred_kwargs)[0]
 
 
     def infer_ball(self, frame_bgr, conf: float = 0.15):
         """Retorna resultado de detección de balón."""
-        return self.ball_model.predict(
-            source=frame_bgr,
-            conf=conf,
-            device=self.device,
-            verbose=False,
-            save=False,
-        )[0]
+        pred_kwargs = {
+            "source": frame_bgr,
+            "conf": conf,
+            "device": self.device,
+            "verbose": False,
+            "save": False,
+        }
+        if self.use_half and self.format == "pt":
+            pred_kwargs["half"] = True
+        return self.ball_model.predict(**pred_kwargs)[0]
 
     def infer(
         self,

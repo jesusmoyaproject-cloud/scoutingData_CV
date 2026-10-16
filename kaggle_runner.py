@@ -30,7 +30,8 @@ logger = logging.getLogger("KaggleRunner")
 
 def run_pipeline(video_path: str, output_path: str, csv_path: str,
                  json_path: str = None, parquet_path: str = None,
-                 mot_path: str = None, homography_json_path: str = None, max_frames: int = None):
+                 mot_path: str = None, homography_json_path: str = None, max_frames: int = None,
+                 homography_interval: int = 1, player_stride: int = 1):
     # Auto-detectar entorno: COLAB o KAGGLE
     target_env = "COLAB" if settings.ENVIRONMENT == "COLAB" else "KAGGLE"
 
@@ -56,6 +57,8 @@ def run_pipeline(video_path: str, output_path: str, csv_path: str,
         "--csv",    csv_path,
         "--env",    target_env,
         "--headless",
+        "--homography-interval", str(homography_interval),
+        "--player-stride", str(player_stride),
     ]
     if json_path:
         cmd.extend(["--json", json_path])
@@ -95,5 +98,10 @@ if __name__ == "__main__":
     parser.add_argument("--mot",          default=None)
     parser.add_argument("--homography-json", default=None, help="Ruta para exportar auditoría JSON de homografía")
     parser.add_argument("--max-frames", "-m", type=int, default=None)
+    parser.add_argument("--homography-interval", type=int, default=1, help="Intervalo de cálculo de homografía")
+    parser.add_argument("--player-stride", type=int, default=1, help="Cadencia de detección de jugadores (1 o 2)")
     args = parser.parse_args()
-    run_pipeline(args.video, args.output, args.csv, args.json, args.parquet, args.mot, args.homography_json, args.max_frames)
+    run_pipeline(
+        args.video, args.output, args.csv, args.json, args.parquet, args.mot,
+        args.homography_json, args.max_frames, args.homography_interval, args.player_stride
+    )

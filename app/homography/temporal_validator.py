@@ -494,8 +494,8 @@ class TemporalHomographyTracker:
             }
             if self.cached_H is not None:
                 if self.reject_streak >= self.max_reject_streak:
-                    logger.warning(
-                        f"Temporal Tracker: auto-reset tras {self.reject_streak} rechazos consecutivos sin homografía."
+                    logger.info(
+                        f"Temporal Tracker: auto-reset tras {self.reject_streak} rechazos consecutivos sin homografía (toma no calibrable: repetición o plano cerrado)."
                     )
                     self.reset()
                     metrics["status"] = "RESET_EMPTY"

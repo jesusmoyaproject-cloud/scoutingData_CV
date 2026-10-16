@@ -99,6 +99,7 @@ def run_pipeline(
     max_frames: int = None,
     headless: bool = True,
     homography_interval: int = 1,
+    player_stride: int = settings.PLAYER_INFERENCE_STRIDE,
     debug_homography: bool = False,
     homography_json_path: str = None,
 ):
@@ -131,6 +132,7 @@ def run_pipeline(
 
     pipeline = SoccerAnalysisV5(
         homography_interval=homography_interval,
+        player_stride=player_stride,
         headless=headless,
     )
 
@@ -168,7 +170,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-frames", "-m", type=int, default=None, help="Límite de frames a procesar")
     parser.add_argument("--headless", action="store_true", default=True, help="Modo headless (alta velocidad, sin renderizar video)")
     parser.add_argument("--with-video", dest="headless", action="store_false", help="Generar también el video MP4 renderizado")
-    parser.add_argument("--homography-interval", type=int, default=1, help="Intervalo de cálculo de homografía")
+    parser.add_argument("--homography-interval", type=int, default=1, help="Intervalo de cálculo de homografía (1=cada frame, 2=cada 2 frames)")
+    parser.add_argument("--player-stride", type=int, default=settings.PLAYER_INFERENCE_STRIDE, help="Stride de inferencia de jugadores (1=todos, 2=interpolar alternados)")
     parser.add_argument("--debug", action="store_true", default=False, help="Modo debug de homografía")
     args = parser.parse_args()
 
@@ -182,6 +185,7 @@ if __name__ == "__main__":
         max_frames=args.max_frames,
         headless=args.headless,
         homography_interval=args.homography_interval,
+        player_stride=args.player_stride,
         debug_homography=args.debug,
         homography_json_path=args.homography_json,
     )
