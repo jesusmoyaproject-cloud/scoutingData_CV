@@ -1,10 +1,14 @@
 import logging
+import warnings
 from typing import Tuple, Optional
 from pathlib import Path
 import time
 import torch
 from ultralytics import YOLO
 from config import settings
+
+warnings.filterwarnings("ignore", message=".*'half' is deprecated.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 logger = logging.getLogger("DirectInferenceEngine")
 perf_logger = logging.getLogger("DirectInferenceEngine.perf")
@@ -102,7 +106,6 @@ class DirectInferenceEngine:
             source=frame_bgr,
             conf=conf,
             device=self.device,
-            half=self.use_half,
             verbose=False,
             save=False,
         )[0]
@@ -118,7 +121,6 @@ class DirectInferenceEngine:
                     conf=conf,
                     iou=nms_iou,
                     device=self.device,
-                    half=self.use_half,
                     persist=True,
                     tracker=tracker_cfg,
                     verbose=False,
@@ -132,7 +134,6 @@ class DirectInferenceEngine:
                         conf=conf,
                         iou=nms_iou,
                         device=self.device,
-                        half=self.use_half,
                         persist=True,
                         tracker="botsort.yaml",
                         verbose=False,
@@ -145,7 +146,6 @@ class DirectInferenceEngine:
             conf=conf,
             iou=nms_iou,
             device=self.device,
-            half=self.use_half,
             verbose=False,
             save=False,
         )[0]
@@ -157,7 +157,6 @@ class DirectInferenceEngine:
             source=frame_bgr,
             conf=conf,
             device=self.device,
-            half=self.use_half,
             verbose=False,
             save=False,
         )[0]

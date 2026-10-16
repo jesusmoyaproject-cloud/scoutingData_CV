@@ -486,15 +486,22 @@ class TemporalHomographyTracker:
                 ransac_outliers=outliers,
                 details=details or "Candidato de homografía no generado",
             )
+            metrics = {
+                "status": state,
+                "reject_reason": reason,
+                "reject_details": details or "Candidato de homografía no generado",
+                "reject_streak": self.reject_streak,
+            }
             if self.cached_H is not None:
                 if self.reject_streak >= self.max_reject_streak:
                     logger.warning(
                         f"Temporal Tracker: auto-reset tras {self.reject_streak} rechazos consecutivos sin homografía."
                     )
                     self.reset()
-                    return None, None, "RESET_EMPTY", {}
-                return self.cached_H, self.cached_mask, "REJECTED_HELD", {}
-            return None, None, "FAILED_NO_PREV", {}
+                    metrics["status"] = "RESET_EMPTY"
+                    return None, None, "RESET_EMPTY", metrics
+                return self.cached_H, self.cached_mask, "REJECTED_HELD", metrics
+            return None, None, "FAILED_NO_PREV", metrics
 
         # ── Caso B: Primera homografía válida o tras reset ──────────────────────
         if self.cached_H is None:
@@ -504,7 +511,11 @@ class TemporalHomographyTracker:
             self.reject_streak = 0
             self.total_accepted += 1
             logger.debug(f"[Frame {fid}] Temporal Tracker: Homografía inicial aceptada.")
-            return self.cached_H, self.cached_mask, "INITIAL_ACCEPTED", {}
+            metrics = {
+                "status": "INITIAL_ACCEPTED",
+                "reject_streak": 0,
+            }
+            return self.cached_H, self.cached_mask, "INITIAL_ACCEPTED", metrics
 
         # ── Caso C: Evaluar transición cinemática contra H previa ───────────────
         trans = decompose_homography_transition(H_cand, self.cached_H, img_width, img_height)
@@ -526,6 +537,12 @@ class TemporalHomographyTracker:
             eff_max_shift_m = self.max_shift_m
             eff_max_corner_m = self.max_corner_shift_m
             eff_max_rot_deg = self.max_rot_deg
+
+        metrics["effective_max_center_shift_m"] = eff_max_shift_m
+        metrics["effective_max_corner_shift_m"] = eff_max_corner_m
+        metrics["effective_max_rot_deg"] = eff_max_rot_deg
+        metrics["max_shear_ratio"] = self.max_shear_ratio
+        metrics["allowed_scale_range"] = f"[{self.min_scale_ratio:.2f}, {self.max_scale_ratio:.2f}]"
 
         is_transition_valid = True
         reject_reason = ""
@@ -557,11 +574,13 @@ class TemporalHomographyTracker:
         # Si un candidato tiene sustento RANSAC indiscutible pero falló el umbral
         # temporal por causa de un paneo veloz acumulado, recuperamos sin congelar:
         if not is_transition_valid and self.enable_fast_recovery and self.reject_streak >= 1:
+            is_scale_sane = (0.85 <= scale <= 1.18) and (corner_shift < self.max_corner_shift_m * 1.5)
             is_high_conf = (
-                mean_err is not None and mean_err < 0.60
+                is_scale_sane
+                and mean_err is not None and mean_err < 0.45
                 and inliers is not None and inliers >= 8
-                and (cov_ratio is None or cov_ratio >= 0.08)
-                and shear <= 1.35
+                and (cov_ratio is None or cov_ratio >= 0.12)
+                and shear <= 1.20
             )
             if is_high_conf:
                 logger.info(
@@ -573,6 +592,8 @@ class TemporalHomographyTracker:
                 self.cached_mask = mask_cand
                 self.reject_streak = 0
                 self.total_accepted += 1
+                metrics["status"] = "FAST_RECOVERY_ACCEPTED"
+                metrics["reject_streak"] = 0
                 return self.cached_H, self.cached_mask, "FAST_RECOVERY_ACCEPTED", metrics
 
         if is_transition_valid:
@@ -595,6 +616,9 @@ class TemporalHomographyTracker:
             self.cached_H = H_final
             self.cached_mask = mask_cand
             logger.debug(f"[Frame {fid}] H aceptada | α={alpha:.2f} | dC={shift:.2f}m rot={rot:.1f}°")
+            metrics["status"] = "ACCEPTED_SMOOTHED"
+            metrics["smoothing_alpha"] = alpha
+            metrics["reject_streak"] = 0
             return self.cached_H, self.cached_mask, "ACCEPTED_SMOOTHED", metrics
 
         # ── Transición inválida: registrar y sostener previa ──────────────────
@@ -620,7 +644,12 @@ class TemporalHomographyTracker:
             details=reject_details,
         )
 
-        if self.reject_streak >= self.max_reject_streak:
+        metrics["status"] = "REJECTED_HELD"
+        metrics["reject_reason"] = reject_reason
+        metrics["reject_details"] = reject_details
+        metrics["reject_streak"] = self.reject_streak
+
+        if self.reject_streak >= self.max_reject_streak and reject_reason not in ("SCALE", "SHEAR"):
             logger.info(
                 f"[Frame {fid}] Temporal Tracker: Auto-reset tras {self.reject_streak} rechazos consecutivos. "
                 "Re-anclando en nueva posición de cámara."
@@ -629,6 +658,8 @@ class TemporalHomographyTracker:
             self.cached_H = H_cand / h22
             self.cached_mask = mask_cand
             self.reject_streak = 0
+            metrics["status"] = "RESET_ACCEPTED"
+            metrics["reject_streak"] = 0
             return self.cached_H, self.cached_mask, "RESET_ACCEPTED", metrics
 
         return self.cached_H, self.cached_mask, "REJECTED_HELD", metrics

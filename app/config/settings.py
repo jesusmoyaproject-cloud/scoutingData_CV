@@ -193,14 +193,16 @@ def _resolve_default_input() -> str:
 DEFAULT_INPUT_VIDEO  = _resolve_default_input()
 DEFAULT_OUTPUT_VIDEO = str(OUTPUT_DIR / "scouting_output.mp4")
 DEFAULT_OUTPUT_CSV   = str(OUTPUT_DIR / "events_output.csv")
-DEFAULT_OUTPUT_JSON  = str(OUTPUT_DIR / f"tracking_{Path(DEFAULT_INPUT_VIDEO).stem}.json")
-DEFAULT_KEYPOINTS_CSV = str(OUTPUT_DIR / f"keypoints_audit_{Path(DEFAULT_INPUT_VIDEO).stem}.csv")
+DEFAULT_OUTPUT_JSON    = str(OUTPUT_DIR / f"tracking_{Path(DEFAULT_INPUT_VIDEO).stem}.json")
+DEFAULT_OUTPUT_PARQUET = str(OUTPUT_DIR / f"tracking_{Path(DEFAULT_INPUT_VIDEO).stem}.parquet")
+DEFAULT_OUTPUT_MOT     = str(OUTPUT_DIR / f"tracking_{Path(DEFAULT_INPUT_VIDEO).stem}.mot")
+DEFAULT_KEYPOINTS_CSV  = str(OUTPUT_DIR / f"keypoints_audit_{Path(DEFAULT_INPUT_VIDEO).stem}.csv")
 # ─── Umbrales y Parámetros ───────────────────────────────────────────────────
 
 CONF_KEYPOINT       = float(os.getenv("CONF_KEYPOINT",       "0.35"))
 CONF_PLAYER         = float(os.getenv("CONF_PLAYER",         "0.4"))
 CONF_BALL           = float(os.getenv("CONF_BALL",           "0.4"))
-RANSAC_THRESHOLD    = float(os.getenv("RANSAC_THRESHOLD",    "1.5"))
+RANSAC_THRESHOLD    = float(os.getenv("RANSAC_THRESHOLD",    "0.8"))
 MINIMAP_SCALE       = float(os.getenv("MINIMAP_SCALE",       "8.0"))
 HOMOGRAPHY_INTERVAL = int(os.getenv("HOMOGRAPHY_INTERVAL",   "1"))   # 1=cada frame, N>1=cada N frames
 DRAW_OUTLIERS       = os.getenv("DRAW_OUTLIERS", "false").lower() in ("true", "1", "yes")

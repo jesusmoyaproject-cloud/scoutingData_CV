@@ -24,6 +24,10 @@ if str(APP_DIR) not in sys.path:
 os.environ["ENVIRONMENT"] = "COLAB"
 os.environ["HEADLESS_MODE"] = "True"
 
+import warnings
+warnings.filterwarnings("ignore", message=".*'half' is deprecated.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import torch
 from config import settings
 from main import SoccerAnalysisV5
@@ -90,10 +94,13 @@ def run_pipeline(
     output_path: str = None,
     csv_path: str = None,
     json_path: str = None,
+    parquet_path: str = None,
+    mot_path: str = None,
     max_frames: int = None,
     headless: bool = True,
     homography_interval: int = 1,
     debug_homography: bool = False,
+    homography_json_path: str = None,
 ):
     print_colab_diagnostic()
 
@@ -109,14 +116,18 @@ def run_pipeline(
     out_dir = Path(settings.OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    actual_output = output_path or str(out_dir / "scouting_output.mp4")
-    actual_csv    = csv_path or str(out_dir / "events_output.csv")
-    actual_json   = json_path or str(out_dir / f"tracking_{resolved_video.stem}.json")
+    actual_output  = output_path or str(out_dir / "scouting_output.mp4")
+    actual_csv     = csv_path or str(out_dir / "events_output.csv")
+    actual_json    = json_path or str(out_dir / f"tracking_{resolved_video.stem}.json")
+    actual_parquet = parquet_path or str(out_dir / f"tracking_{resolved_video.stem}.parquet")
+    actual_homography_json = homography_json_path or str(out_dir / f"homography_{resolved_video.stem}.json")
 
     logger.info(f"🎬 Procesando: {resolved_video.name}")
-    logger.info(f"   Salida Video: {actual_output if not headless else '[HEADLESS - Omitido]'}")
-    logger.info(f"   Salida JSON:  {actual_json}")
-    logger.info(f"   Salida CSV:   {actual_csv}")
+    logger.info(f"   Salida Video:      {actual_output if not headless else '[HEADLESS - Omitido]'}")
+    logger.info(f"   Salida JSON:       {actual_json}")
+    logger.info(f"   Salida Homografía: {actual_homography_json}")
+    logger.info(f"   Salida Parquet:    {actual_parquet}")
+    logger.info(f"   Salida CSV:        {actual_csv}")
 
     pipeline = SoccerAnalysisV5(
         homography_interval=homography_interval,
@@ -128,14 +139,19 @@ def run_pipeline(
         output_path=actual_output,
         csv_output_path=actual_csv,
         json_output_path=actual_json,
+        parquet_output_path=actual_parquet,
+        mot_output_path=mot_path,
         max_frames=max_frames,
         headless=headless,
         debug_homography=debug_homography,
+        homography_json_path=actual_homography_json,
     )
 
     logger.info("=" * 68)
     logger.info(f"🎉 Proceso completado exitosamente en Google Colab.")
-    logger.info(f"   📄 Tracking JSON disponible en: {actual_json}")
+    logger.info(f"   📄 Tracking JSON:    {actual_json}")
+    logger.info(f"   📐 Homografía JSON:  {actual_homography_json}")
+    logger.info(f"   📊 Tracking Parquet: {actual_parquet}")
     logger.info("=" * 68)
     return True
 
@@ -146,6 +162,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", default=None, help="Ruta de video de salida (si no es headless)")
     parser.add_argument("--csv",    "-c", default=None, help="Ruta del CSV de eventos")
     parser.add_argument("--json",   "-j", default=None, help="Ruta del JSON de tracking")
+    parser.add_argument("--parquet", "-p", default=None, help="Ruta del Parquet de tracking (ML/DL)")
+    parser.add_argument("--mot",          default=None, help="Ruta del archivo MOTChallenge (.mot)")
+    parser.add_argument("--homography-json", default=None, help="Ruta para exportar auditoría JSON de homografía")
     parser.add_argument("--max-frames", "-m", type=int, default=None, help="Límite de frames a procesar")
     parser.add_argument("--headless", action="store_true", default=True, help="Modo headless (alta velocidad, sin renderizar video)")
     parser.add_argument("--with-video", dest="headless", action="store_false", help="Generar también el video MP4 renderizado")
@@ -158,8 +177,11 @@ if __name__ == "__main__":
         output_path=args.output,
         csv_path=args.csv,
         json_path=args.json,
+        parquet_path=args.parquet,
+        mot_path=args.mot,
         max_frames=args.max_frames,
         headless=args.headless,
         homography_interval=args.homography_interval,
         debug_homography=args.debug,
+        homography_json_path=args.homography_json,
     )

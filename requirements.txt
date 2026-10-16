@@ -5,3 +5,6 @@ numpy>=1.23.0
 torch>=2.0.0
 torchvision>=0.15.0
 scipy>=1.10.0
+supervision>=0.20.0
+pandas>=2.0.0
+pyarrow>=14.0.0

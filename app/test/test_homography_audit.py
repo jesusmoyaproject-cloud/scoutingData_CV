@@ -24,7 +24,9 @@ from homography.geometric_validator import (
     compute_collinearity_score,
     validate_keypoint_geometry,
     filter_border_keypoints,
+    filter_spatial_swaps_and_hallucinations,
 )
+from homography.estimator import compute_homography
 from homography.temporal_validator import (
     decompose_homography_transition,
     TemporalHomographyTracker,
@@ -359,6 +361,337 @@ class TestHomographyAudit(unittest.TestCase):
         self.assertIsNotNone(drawn)
         self.assertGreater(drawn.sum(), 0, "El overlay residual debe pintar píxeles en el canvas")
 
+    def test_homography_audit_exporter_json_structure(self):
+        """Verifica que HomographyAuditExporter exporte el JSON con la estructura correcta y completa."""
+        import json
+        import tempfile
+        from homography.keypoint_audit_logger import HomographyAuditExporter
+
+        exporter = HomographyAuditExporter()
+
+        # Mock de keypoint result
+        class MockKeypoints:
+            xy = np.array([self.clean_image_pts], dtype=np.float32)
+            conf = np.ones((1, len(self.clean_image_pts)), dtype=np.float32) * 0.95
+
+            def __len__(self):
+                return len(self.xy)
+
+        class MockResult:
+            keypoints = MockKeypoints()
+
+        # Simular frame 1 (Initial)
+        trans_1 = {"status": "INITIAL_ACCEPTED", "reject_streak": 0}
+        exporter.record_frame(
+            frame_idx=1,
+            timestamp_sec=0.033,
+            kp_result=MockResult(),
+            homography_status="INITIAL_ACCEPTED",
+            H_effective=self.H_gt,
+            H_candidate=self.H_gt,
+            transition_metrics=trans_1,
+        )
+
+        # Simular frame 2 (Smoothed con corrección)
+        trans_2 = {
+            "status": "ACCEPTED_SMOOTHED",
+            "center_shift_m": 0.45,
+            "max_corner_shift_m": 0.80,
+            "rotation_deg": 0.35,
+            "scale_ratio": 1.01,
+            "shear_ratio": 1.02,
+            "smoothing_alpha": 0.65,
+            "effective_max_center_shift_m": 3.5,
+            "effective_max_corner_shift_m": 6.0,
+            "effective_max_rot_deg": 5.0,
+            "max_shear_ratio": 1.30,
+            "allowed_scale_range": "[0.75, 1.30]",
+            "reject_streak": 0,
+        }
+        exporter.record_frame(
+            frame_idx=2,
+            timestamp_sec=0.066,
+            kp_result=MockResult(),
+            homography_status="ACCEPTED_SMOOTHED",
+            H_effective=self.H_gt,
+            H_candidate=self.H_gt,
+            transition_metrics=trans_2,
+        )
+
+        # Simular frame 3 (Rechazado con holding)
+        trans_3 = {
+            "status": "REJECTED_HELD",
+            "center_shift_m": 4.8,
+            "max_corner_shift_m": 7.2,
+            "rotation_deg": 1.2,
+            "scale_ratio": 1.05,
+            "shear_ratio": 1.01,
+            "effective_max_center_shift_m": 3.5,
+            "effective_max_corner_shift_m": 6.0,
+            "effective_max_rot_deg": 5.0,
+            "max_shear_ratio": 1.30,
+            "allowed_scale_range": "[0.75, 1.30]",
+            "reject_reason": "CENTER_SHIFT",
+            "reject_details": "Salto de centro excesivo: 4.80m > 3.50m",
+            "reject_streak": 1,
+        }
+        exporter.record_frame(
+            frame_idx=3,
+            timestamp_sec=0.100,
+            kp_result=MockResult(),
+            homography_status="REJECTED_HELD",
+            H_effective=self.H_gt,
+            H_candidate=self.H_gt,
+            transition_metrics=trans_3,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            exported_path = exporter.save_to_json(
+                tmp_path,
+                metadata={"video_name": "match_test.mp4", "fps": 30.0, "total_frames": 3}
+            )
+            self.assertTrue(Path(exported_path).exists())
+
+            with open(exported_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # 1. Verificar metadata y summary
+            self.assertIn("metadata", data)
+            self.assertEqual(data["metadata"]["video_name"], "match_test.mp4")
+            self.assertEqual(data["metadata"]["fps"], 30.0)
+            self.assertIn("summary", data["metadata"])
+            summary = data["metadata"]["summary"]
+            self.assertEqual(summary["total_frames_evaluated"], 3)
+            self.assertEqual(summary["frames_with_valid_homography"], 3)
+            self.assertEqual(summary["frames_with_corrections_applied"], 2) # frame 2 y 3
+            self.assertIn("CENTER_SHIFT", summary["rejections_by_reason"])
+
+            # 2. Verificar frames
+            self.assertIn("frames", data)
+            self.assertEqual(len(data["frames"]), 3)
+
+            # Frame 1
+            f1 = data["frames"][0]
+            self.assertEqual(f1["frame"], 1)
+            self.assertEqual(f1["timestamp"], 0.033)
+            self.assertTrue(f1["homography"]["valid"])
+            self.assertIsInstance(f1["homography"]["matrix_effective"], list)
+            self.assertEqual(len(f1["homography"]["matrix_effective"]), 3)
+            self.assertEqual(len(f1["homography"]["matrix_effective"][0]), 3)
+            self.assertIsInstance(f1["puntos_correctos"], list)
+            self.assertIsInstance(f1["puntos_fallidos"], list)
+            self.assertFalse(f1["correcciones"]["correction_applied"])
+            self.assertEqual(f1["correcciones"]["correction_type"], "INITIAL")
+
+            # Frame 2 (Corrección de suavizado)
+            f2 = data["frames"][1]
+            self.assertEqual(f2["frame"], 2)
+            self.assertTrue(f2["correcciones"]["correction_applied"])
+            self.assertEqual(f2["correcciones"]["correction_type"], "TEMPORAL_SMOOTHING")
+            self.assertEqual(f2["correcciones"]["transition_metrics"]["center_shift_m"], 0.45)
+            self.assertEqual(f2["correcciones"]["transition_metrics"]["smoothing_alpha"], 0.65)
+
+            # Frame 3 (Corrección de holding por rechazo)
+            f3 = data["frames"][2]
+            self.assertEqual(f3["frame"], 3)
+            self.assertTrue(f3["correcciones"]["correction_applied"])
+            self.assertEqual(f3["correcciones"]["correction_type"], "HOLD_PREVIOUS_ON_REJECTION")
+            self.assertEqual(f3["correcciones"]["reject_reason"], "CENTER_SHIFT")
+            self.assertEqual(f3["correcciones"]["reject_streak"], 1)
+            self.assertIn("4.80m", f3["correcciones"]["details"])
+
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    def test_homography_audit_points_details(self):
+        """Verifica la clasificación precisa de puntos correctos y fallidos."""
+        from homography.keypoint_audit_logger import HomographyAuditExporter
+        from homography.diagnostics_tool import PointResidual
+
+        exporter = HomographyAuditExporter(conf_threshold=0.35)
+
+        # Mock de 3 puntos: 1 inlier, 1 outlier RANSAC, 1 baja confianza
+        # Puntos: 01 (u=500, v=190), 02 (u=315, v=260), 03 (u=130, v=330)
+        kps_xy = np.array([[
+            [500.0, 190.0],  # 01
+            [315.0, 260.0],  # 02
+            [130.0, 330.0],  # 03
+            [2.0, 2.0],      # borde pantalla < 4px
+        ]], dtype=np.float32)
+        kps_conf = np.array([[0.90, 0.85, 0.20, 0.95]], dtype=np.float32)
+
+        class MockKeypoints:
+            xy = kps_xy
+            conf = kps_conf
+
+            def __len__(self):
+                return len(self.xy)
+
+        class MockResult:
+            keypoints = MockKeypoints()
+
+        res_01 = PointResidual(
+            kp_idx=0, kp_label="01", confidence=0.90,
+            detected_px=(500.0, 190.0), reprojected_px=(500.2, 189.9),
+            field_m=(0.0, 0.0), reprojected_m=(0.02, -0.01),
+            error_px=0.22, error_m=0.022, is_inlier=True
+        )
+        res_02 = PointResidual(
+            kp_idx=1, kp_label="02", confidence=0.85,
+            detected_px=(315.0, 260.0), reprojected_px=(340.0, 290.0),
+            field_m=(0.0, 13.84), reprojected_m=(3.2, 17.5),
+            error_px=39.05, error_m=4.82, is_inlier=False
+        )
+
+        exporter.record_frame(
+            frame_idx=10,
+            timestamp_sec=0.333,
+            kp_result=MockResult(),
+            homography_status="ACCEPTED_SMOOTHED",
+            H_effective=self.H_gt,
+            H_candidate=self.H_gt,
+            residuals=[res_01, res_02],
+            conf_threshold=0.35,
+        )
+
+        f_data = exporter.frames_data[0]
+        correctos = f_data["puntos_correctos"]
+        fallidos = f_data["puntos_fallidos"]
+
+        # 01 debe estar en puntos_correctos como inlier
+        self.assertEqual(len(correctos), 1)
+        self.assertEqual(correctos[0]["kp_label"], "01")
+        self.assertEqual(correctos[0]["status"], "INLIER")
+        self.assertAlmostEqual(correctos[0]["error_m"], 0.022, places=2)
+
+        # 02 (outlier), 03 (baja conf < 0.35) y 4to punto (borde) deben estar en puntos_fallidos
+        fail_reasons = {p["reason"] for p in fallidos}
+        self.assertIn("OUTLIER_RANSAC", fail_reasons)
+        self.assertIn("LOW_CONFIDENCE", fail_reasons)
+        self.assertIn("DISCARDED_SCREEN_BORDER", fail_reasons)
+
+    def test_homography_audit_no_console_logging(self):
+        """Verifica que record_frame y save_to_json no emitan logs de puntos por consola."""
+        import logging
+        from homography.keypoint_audit_logger import HomographyAuditExporter
+
+        exporter = HomographyAuditExporter()
+
+        class MockKeypoints:
+            xy = np.array([self.clean_image_pts], dtype=np.float32)
+            conf = np.ones((1, len(self.clean_image_pts)), dtype=np.float32) * 0.95
+
+            def __len__(self):
+                return len(self.xy)
+
+        class MockResult:
+            keypoints = MockKeypoints()
+
+        with self.assertLogs("homography.audit", level="DEBUG") as cm:
+            # Emite un log de prueba para verificar que el logger funciona
+            logging.getLogger("homography.audit").debug("TEST_LOG_MARKER")
+            exporter.record_frame(
+                frame_idx=1,
+                timestamp_sec=0.033,
+                kp_result=MockResult(),
+                homography_status="INITIAL_ACCEPTED",
+                H_effective=self.H_gt,
+                H_candidate=self.H_gt,
+            )
+
+        # Verificar que solo esté nuestro marcador y NINGÚN log de puntos o frame
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("TEST_LOG_MARKER", cm.output[0])
+        self.assertNotIn("puntos_correctos", cm.output[0])
+        self.assertNotIn("puntos_fallidos", cm.output[0])
+
+    def test_border_keypoint_dynamic_banner_grass_filter(self):
+        """Verifica que filter_border_keypoints descarte puntos sobre banners sin césped cuando se provee frame_bgr."""
+        frame = np.full((300, 300, 3), (35, 140, 35), dtype=np.uint8)  # Césped verde
+        frame[240:300, :] = (0, 0, 240)  # Banner rojo inferior
+
+        candidates = [
+            (0, np.array([150.0, 100.0]), 0.90, "15"),  # Sobre césped -> válido
+            (1, np.array([150.0, 260.0]), 0.85, "18"),  # Sobre banner publicitario -> descartado
+        ]
+
+        filtered = filter_border_keypoints(
+            candidates, img_width=300, img_height=300, border_margin_px=10.0, frame_bgr=frame
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0][3], "15")
+
+    def test_filter_spatial_swaps_and_hallucinations_corner(self):
+        """Verifica que un córner alucinado (27) sobre el área grande (20) sea descartado por topología."""
+        candidates = [
+            (19, np.array([500.0, 200.0]), 0.85, "20"),
+            (20, np.array([500.0, 400.0]), 0.85, "21"),
+            (21, np.array([500.0, 600.0]), 0.85, "22"),
+            (22, np.array([500.0, 800.0]), 0.85, "23"),
+            # Alucinación: córner 27 muy pegado al vértice 20 (<120 px pero a >12m en campo)
+            (26, np.array([508.0, 205.0]), 0.75, "27"),
+        ]
+
+        filtered = filter_spatial_swaps_and_hallucinations(candidates, FIELD_COORDS)
+        labels = [c[3] for c in filtered]
+        self.assertNotIn("27", labels, "El córner alucinado debe haber sido descartado")
+        self.assertIn("20", labels)
+        self.assertEqual(len(filtered), 4)
+
+    def test_fast_recovery_rejects_scale_contraction(self):
+        """Verifica que Fast-Recovery no re-ancle si la homografía candidata tiene contracción de escala."""
+        tracker = TemporalHomographyTracker(max_shift_m=4.5)
+        tracker.update(self.H_gt, np.ones((len(self.clean_image_pts), 1), dtype=np.uint8), frame_id=1)
+
+        T = np.array([[1, 0, -960.0], [0, 1, -540.0], [0, 0, 1]], dtype=np.float64)
+        S = np.array([[0.65, 0, 0], [0, 0.65, 0], [0, 0, 1]], dtype=np.float64)
+        T_inv = np.array([[1, 0, 960.0], [0, 1, 540.0], [0, 0, 1]], dtype=np.float64)
+        M_img = T_inv @ S @ T
+        H_deformed = self.H_gt @ M_img
+
+        diag = HomographyDiagnostics(
+            mean_reprojection_error_m=0.30,
+            ransac_inliers=10,
+            field_coverage_ratio=0.20,
+        )
+
+        _, _, status, _ = tracker.update(
+            H_deformed,
+            np.ones((10, 1), dtype=np.uint8),
+            frame_id=2,
+            diagnostics=diag,
+        )
+        self.assertEqual(status, "REJECTED_HELD")
+        self.assertNotEqual(status, "FAST_RECOVERY_ACCEPTED")
+
+    def test_auto_reset_avoids_scale_or_shear(self):
+        """Verifica que tras exceder max_reject_streak, no se produzca auto-reset si la falla es SCALE o SHEAR."""
+        tracker = TemporalHomographyTracker(max_shift_m=4.5, max_reject_streak=3)
+        tracker.update(self.H_gt, np.ones((len(self.clean_image_pts), 1), dtype=np.uint8), frame_id=1)
+
+        T = np.array([[1, 0, -960.0], [0, 1, -540.0], [0, 0, 1]], dtype=np.float64)
+        S = np.array([[0.50, 0, 0], [0, 0.50, 0], [0, 0, 1]], dtype=np.float64)
+        T_inv = np.array([[1, 0, 960.0], [0, 1, 540.0], [0, 0, 1]], dtype=np.float64)
+        M_img = T_inv @ S @ T
+        H_scale = self.H_gt @ M_img
+
+        # Enviar 3 frames consecutivos con deformación de escala
+        for fid in range(2, 5):
+            _, _, status, metrics = tracker.update(
+                H_scale,
+                np.ones((len(self.clean_image_pts), 1), dtype=np.uint8),
+                frame_id=fid,
+            )
+
+        # En el 3er frame de rechazo (streak=3 >= max_reject_streak), el estado debe seguir siendo REJECTED_HELD
+        self.assertEqual(status, "REJECTED_HELD")
+        self.assertNotEqual(status, "RESET_ACCEPTED")
+        self.assertEqual(metrics.get("reject_reason"), "SCALE")
+
 
 if __name__ == "__main__":
     unittest.main()
+

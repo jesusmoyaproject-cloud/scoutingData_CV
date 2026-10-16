@@ -12,6 +12,7 @@ from homography.validation import validate_homography_matrix
 from homography.geometric_validator import (
     validate_keypoint_geometry,
     filter_border_keypoints,
+    filter_spatial_swaps_and_hallucinations,
     compute_convex_hull_and_coverage,
     compute_collinearity_score,
 )
@@ -118,13 +119,14 @@ def filter_keypoints_by_pitch_side(
 def compute_homography(
     result,
     conf_threshold: float = 0.35,
-    ransac_threshold: float = 1.5,       # Umbral calibrado en metros (1.5m en terreno)
+    ransac_threshold: float = 0.8,       # Umbral calibrado en metros (0.8m en terreno)
     enable_side_filter: bool = True,
-    filter_border_margin_px: float = 4.0, # Descartar keypoints truncados en bordes de imagen
+    filter_border_margin_px: float = 12.0, # Descartar keypoints truncados en bordes de imagen
     img_width: int = 1920,
     img_height: int = 1080,
     validate_geometry: bool = True,
     method: int = DEFAULT_HOMOGRAPHY_METHOD,
+    frame_bgr: Optional[np.ndarray] = None,
 ) -> HomographyEstimateResult:
     """
     Estima la homografía (imagen -> terreno) con validación geométrica previa,
@@ -164,11 +166,16 @@ def compute_homography(
                 continue
             valid_candidates.append((idx, xy, float(conf), lbl))
 
-    # 2. Filtro de keypoints pegados al borde de pantalla (truncamiento de CNN)
-    if filter_border_margin_px > 0:
+    # 2. Filtro de keypoints pegados al borde de pantalla y banners dinámicos
+    if filter_border_margin_px > 0 or frame_bgr is not None:
         valid_candidates = filter_border_keypoints(
-            valid_candidates, img_width=img_width, img_height=img_height, border_margin_px=filter_border_margin_px
+            valid_candidates,
+            img_width=img_width,
+            img_height=img_height,
+            border_margin_px=filter_border_margin_px,
+            frame_bgr=frame_bgr,
         )
+    valid_candidates = filter_spatial_swaps_and_hallucinations(valid_candidates, FIELD_COORDS)
 
     image_pts_list = [xy for _, xy, _, _ in valid_candidates]
     field_pts_list = [FIELD_COORDS[lbl] for _, _, _, lbl in valid_candidates]
@@ -180,6 +187,7 @@ def compute_homography(
         raise ValueError(f"At least 4 keypoints required to compute homography. Found: {len(image_pts)}")
 
     # 3. Validación geométrica previa (Colinealidad, Convex Hull, Dispersión)
+    geom_meta = {}
     if validate_geometry:
         is_geom_ok, reason, geom_meta = validate_keypoint_geometry(
             image_pts, field_pts, img_width=img_width, img_height=img_height
@@ -212,10 +220,23 @@ def compute_homography(
     if inliers_count < 4:
         raise ValueError(f"Insufficient RANSAC inliers: {inliers_count} < 4")
 
-    # 5. Cálculo de métricas de diagnóstico
-    err_info = compute_reprojection_errors(H, image_pts, field_pts)
-    cov_info = compute_convex_hull_and_coverage(image_pts, field_pts, img_width=img_width, img_height=img_height)
-    collin_score = compute_collinearity_score(field_pts)
+    # 5. Cálculo de métricas de diagnóstico sobre inliers
+    inlier_mask = mask.ravel().astype(bool)
+    inlier_img_pts = image_pts[inlier_mask]
+    inlier_fld_pts = field_pts[inlier_mask]
+
+    if validate_geometry:
+        is_inlier_geom_ok, inlier_reason, geom_meta = validate_keypoint_geometry(
+            inlier_img_pts, inlier_fld_pts, img_width=img_width, img_height=img_height
+        )
+        if not is_inlier_geom_ok:
+            raise ValueError(f"Configuración de inliers post-RANSAC degenerada: {inlier_reason}")
+
+    err_info = compute_reprojection_errors(H, inlier_img_pts, inlier_fld_pts)
+    cov_info = compute_convex_hull_and_coverage(
+        inlier_img_pts, inlier_fld_pts, img_width=img_width, img_height=img_height
+    )
+    collin_score = compute_collinearity_score(inlier_fld_pts)
 
     # Condición de la matriz normalizada
     h_norm = H / (H[2, 2] if abs(H[2, 2]) > 1e-9 else 1.0)

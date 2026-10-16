@@ -145,27 +145,117 @@ def validate_keypoint_geometry(
     return True, "OK", geom_metrics
 
 
+CORNER_LABELS = {"01", "06", "27", "32"}
+
+
 def filter_border_keypoints(
     candidates: list,
     img_width: int = 1920,
     img_height: int = 1080,
-    border_margin_px: float = 4.0,
+    border_margin_px: float = 12.0,
+    frame_bgr: Optional[np.ndarray] = None,
+    patch_radius: int = 15,
+    min_grass_ratio: float = 0.25,
 ) -> list:
     """
-    Descarta keypoints pegados al borde de la imagen causados por clamping/truncamiento de la red neuronal.
-    candidates es una lista de tuplas: (idx, xy, conf, label) o similar donde xy tiene coordenadas [x, y].
+    1. Descarta keypoints pegados al borde físico de la imagen (clamping de la CNN).
+    2. Si se provee frame_bgr, verifica presencia de césped en HSV alrededor del punto (30x30 px)
+       para descartar detecciones sobre banners publicitarios intermitentes u overlays de TV.
     """
     filtered = []
     for item in candidates:
         xy = item[1]
         x, y = float(xy[0]), float(xy[1])
+        lbl = item[3]
+
         if (
             x <= border_margin_px
             or y <= border_margin_px
             or x >= (img_width - border_margin_px)
             or y >= (img_height - border_margin_px)
         ):
-            logger.debug(f"Keypoint descartado por borde de imagen: {item[3]} en ({x:.1f}, {y:.1f})")
+            logger.debug(f"Keypoint descartado por borde de imagen: {lbl} en ({x:.1f}, {y:.1f})")
             continue
+
+        if frame_bgr is not None:
+            ix, iy = int(round(x)), int(round(y))
+            y0, y1 = max(0, iy - patch_radius), min(img_height, iy + patch_radius)
+            x0, x1 = max(0, ix - patch_radius), min(img_width, ix + patch_radius)
+            patch = frame_bgr[y0:y1, x0:x1]
+            if patch.size > 0:
+                hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                grass_mask = cv2.inRange(hsv_patch, (28, 30, 30), (95, 255, 255))
+                grass_ratio = float(np.count_nonzero(grass_mask)) / float(grass_mask.size)
+                if grass_ratio < min_grass_ratio:
+                    logger.debug(
+                        f"Keypoint {lbl} en ({x:.1f}, {y:.1f}) descartado por banner/overlay "
+                        f"(grass_ratio={grass_ratio:.2f} < {min_grass_ratio})"
+                    )
+                    continue
+
         filtered.append(item)
     return filtered
+
+
+def filter_spatial_swaps_and_hallucinations(
+    candidates: list,
+    field_coords: dict,
+    min_field_dist_m: float = 12.0,
+    min_pixel_dist_for_far_points: float = 120.0,
+) -> list:
+    if len(candidates) < 4:
+        return candidates
+
+    bad_indices = set()
+    n = len(candidates)
+
+    def _eff_conf(conf: float, lbl: str) -> float:
+        return conf * 0.85 if lbl in CORNER_LABELS else conf
+
+    for i in range(n):
+        idx_i, xy_i, conf_i, lbl_i = candidates[i]
+        px_i, py_i = float(xy_i[0]), float(xy_i[1])
+        if lbl_i not in field_coords:
+            continue
+        fx_i, fy_i = field_coords[lbl_i]
+        eff_i = _eff_conf(conf_i, lbl_i)
+
+        conflicts = 0
+        for j in range(n):
+            if i == j:
+                continue
+            idx_j, xy_j, conf_j, lbl_j = candidates[j]
+            px_j, py_j = float(xy_j[0]), float(xy_j[1])
+            if lbl_j not in field_coords:
+                continue
+            fx_j, fy_j = field_coords[lbl_j]
+            eff_j = _eff_conf(conf_j, lbl_j)
+
+            dist_field = float(np.hypot(fx_i - fx_j, fy_i - fy_j))
+            dist_px = float(np.hypot(px_i - px_j, py_i - py_j))
+
+            # Regla 1: Colapso espacial (puntos lejanos en campo pero muy juntos en imagen)
+            if dist_field >= min_field_dist_m and dist_px < min_pixel_dist_for_far_points:
+                if eff_i <= eff_j:
+                    conflicts += 2 if (lbl_i in CORNER_LABELS and conf_j > 0.70) else 1
+
+            # Regla 2: Monotonía vertical en Y (misma línea longitudinal X en campo)
+            if abs(fx_i - fx_j) <= 3.0 and abs(fy_i - fy_j) >= 5.0:
+                if (fy_i < fy_j and py_i > py_j - 15.0) or (fy_i > fy_j and py_i < py_j + 15.0):
+                    if eff_i <= eff_j:
+                        conflicts += 1
+
+            # Regla 3: Monotonía horizontal en X (profundidad Y similar en campo)
+            if abs(fy_i - fy_j) <= 6.0 and abs(fx_i - fx_j) >= 10.0:
+                if (fx_i < fx_j and px_i > px_j - 15.0) or (fx_i > fx_j and px_i < px_j + 15.0):
+                    if eff_i <= eff_j:
+                        conflicts += 1
+
+        if conflicts >= 2:
+            logger.debug(
+                f"Keypoint {lbl_i} descartado por incoherencia topológica ({conflicts} conflictos)."
+            )
+            bad_indices.add(i)
+
+    return [c for i, c in enumerate(candidates) if i not in bad_indices]
+

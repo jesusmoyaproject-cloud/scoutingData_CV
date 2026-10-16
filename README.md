@@ -137,7 +137,10 @@ python kaggle_runner.py --video /kaggle/input/soccer-match/input.mp4 --output /k
 | `--video` | `-v` | Ruta al video de entrada | `settings.DEFAULT_INPUT_VIDEO` |
 | `--output` | `-o` | Ruta del video procesado (.mp4) | `outputs/scouting_output.mp4` |
 | `--json` | `-j` | Ruta del JSON de tracking estructurado | Auto (`outputs/tracking_<name>.json`) |
+| `--parquet` | `-p` | Ruta de exportación Parquet (ML/DL tabular) | Auto (`outputs/tracking_<name>.parquet`) |
+| `--mot` | | Exportar formato MOTChallenge (TrackEval) | `None` |
 | `--csv` | `-c` | Ruta del archivo CSV de eventos | `outputs/events_output.csv` |
+| `--env` | `-e` | Entorno de ejecución (`LOCAL`, `KAGGLE`, `COLAB`) | Auto |
 | `--headless` | | Ejecutar en modo Headless (sin video/overlays) | Auto según entorno |
 | `--max-frames` | `-m` | Limita la cantidad de frames a procesar | `None` (todo el video) |
 | `--homography-interval` | | Recalcular H cada N frames | `1` |

@@ -19,13 +19,18 @@ BASE_DIR = Path(__file__).resolve().parent
 APP_DIR  = BASE_DIR / "app"
 sys.path.insert(0, str(APP_DIR))
 
+import warnings
+warnings.filterwarnings("ignore", message=".*'half' is deprecated.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 from config import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("KaggleRunner")
 
 def run_pipeline(video_path: str, output_path: str, csv_path: str,
-                 json_path: str = None, max_frames: int = None):
+                 json_path: str = None, parquet_path: str = None,
+                 mot_path: str = None, homography_json_path: str = None, max_frames: int = None):
     # Auto-detectar entorno: COLAB o KAGGLE
     target_env = "COLAB" if settings.ENVIRONMENT == "COLAB" else "KAGGLE"
 
@@ -54,6 +59,12 @@ def run_pipeline(video_path: str, output_path: str, csv_path: str,
     ]
     if json_path:
         cmd.extend(["--json", json_path])
+    if parquet_path:
+        cmd.extend(["--parquet", parquet_path])
+    if mot_path:
+        cmd.extend(["--mot", mot_path])
+    if homography_json_path:
+        cmd.extend(["--homography-json", homography_json_path])
     if max_frames:
         cmd.extend(["--max-frames", str(max_frames)])
 
@@ -62,9 +73,13 @@ def run_pipeline(video_path: str, output_path: str, csv_path: str,
         result = subprocess.run(cmd, check=True)
         if result.returncode == 0:
             actual_json = json_path or str(settings.OUTPUT_DIR / f"tracking_{resolved_video.stem}.json")
+            actual_parquet = parquet_path or str(settings.OUTPUT_DIR / f"tracking_{resolved_video.stem}.parquet")
+            actual_homography = homography_json_path or str(settings.OUTPUT_DIR / f"homography_{resolved_video.stem}.json")
             logger.info(f"✅ Completado exitosamente en modo Headless.")
-            logger.info(f"   Tracking JSON: {actual_json}")
-            logger.info(f"   Eventos CSV:   {csv_path}")
+            logger.info(f"   Tracking JSON:    {actual_json}")
+            logger.info(f"   Homografía JSON:  {actual_homography}")
+            logger.info(f"   Tracking Parquet: {actual_parquet}")
+            logger.info(f"   Eventos CSV:      {csv_path}")
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Error: El pipeline finalizó con código de error {e.returncode}.")
         logger.error("   Revisa el log detallado superior para verificar si faltó algún modelo o librería.")
@@ -76,6 +91,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", default=settings.DEFAULT_OUTPUT_VIDEO)
     parser.add_argument("--csv",    "-c", default=settings.DEFAULT_OUTPUT_CSV)
     parser.add_argument("--json",   "-j", default=None)
+    parser.add_argument("--parquet", "-p", default=None)
+    parser.add_argument("--mot",          default=None)
+    parser.add_argument("--homography-json", default=None, help="Ruta para exportar auditoría JSON de homografía")
     parser.add_argument("--max-frames", "-m", type=int, default=None)
     args = parser.parse_args()
-    run_pipeline(args.video, args.output, args.csv, args.json, args.max_frames)
+    run_pipeline(args.video, args.output, args.csv, args.json, args.parquet, args.mot, args.homography_json, args.max_frames)

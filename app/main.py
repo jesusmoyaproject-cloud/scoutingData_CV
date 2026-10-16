@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import cv2
 import numpy as np
+import supervision as sv
 
 APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
@@ -37,6 +38,7 @@ from engine.threaded_reader import ThreadedOpenCVReader
 from homography.estimator import compute_homography
 from homography.temporal_validator import TemporalHomographyTracker
 from homography.transforms import pixel_to_field
+from homography.keypoint_audit_logger import HomographyAuditExporter
 from homography.diagnostics_tool import (
     generate_residuals_table,
     run_leave_one_out_analysis,
@@ -88,56 +90,33 @@ def _enable_debug_mode():
 
 
 
-def _extract_ball_detection(ball_result, conf_threshold: float) -> Optional[Dict]:
-    """Extrae la mejor detección de balón de un resultado YOLO nativo."""
-    if ball_result.boxes is None or len(ball_result.boxes) == 0:
-        return None
+def _extract_ball_candidates(ball_result, conf_threshold: float) -> List[Dict]:
+    """Extrae todos los candidatos de detección de balón ordenados por confianza."""
+    if ball_result is None or ball_result.boxes is None or len(ball_result.boxes) == 0:
+        return []
     b_boxes = ball_result.boxes.xyxy.cpu().numpy()
     b_confs = ball_result.boxes.conf.cpu().numpy()
-    best_idx = int(np.argmax(b_confs))
-    if float(b_confs[best_idx]) < conf_threshold:
-        return None
-    bx1, by1, bx2, by2 = b_boxes[best_idx]
-    return {
-        "pixel_x":     round(float((bx1 + bx2) / 2), 2),
-        "pixel_y":     round(float((by1 + by2) / 2), 2),
-        "confidence":  float(b_confs[best_idx]),
-        "interpolated": False,
-        "bbox":        [float(bx1), float(by1), float(bx2), float(by2)],
-    }
+    candidates = []
+    for box, conf in zip(b_boxes, b_confs):
+        c = float(conf)
+        if c >= conf_threshold:
+            bx1, by1, bx2, by2 = box
+            candidates.append({
+                "pixel_x":     round(float((bx1 + bx2) / 2), 2),
+                "pixel_y":     round(float((by1 + by2) / 2), 2),
+                "confidence":  round(c, 4),
+                "interpolated": False,
+                "bbox":        [round(float(bx1), 2), round(float(by1), 2), round(float(bx2), 2), round(float(by2), 2)],
+            })
+    # Ordenar candidatos de mayor a menor confianza
+    candidates.sort(key=lambda d: d["confidence"], reverse=True)
+    return candidates
 
 
-def _deduplicate_player_detections(detections: List[Dict], iou_thresh: float = 0.45) -> List[Dict]:
-    """Suprime detecciones duplicadas del mismo jugador en el mismo frame (ej. sobreposición de tracks)."""
-    if len(detections) <= 1:
-        return detections
-    sorted_dets = sorted(detections, key=lambda d: d.get("confidence", 0.0), reverse=True)
-    kept: List[Dict] = []
-    for det in sorted_dets:
-        b1 = det.get("bbox")
-        if not b1 or len(b1) != 4:
-            kept.append(det)
-            continue
-        is_dup = False
-        for k in kept:
-            b2 = k.get("bbox")
-            if not b2 or len(b2) != 4:
-                continue
-            ix1, iy1 = max(b1[0], b2[0]), max(b1[1], b2[1])
-            ix2, iy2 = min(b1[2], b2[2]), min(b1[3], b2[3])
-            iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-            inter = iw * ih
-            if inter > 0:
-                area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
-                area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
-                denom = area1 + area2 - inter
-                iou = inter / denom if denom > 0 else 0.0
-                if iou >= iou_thresh:
-                    is_dup = True
-                    break
-        if not is_dup:
-            kept.append(det)
-    return kept
+def _extract_ball_detection(ball_result, conf_threshold: float) -> Optional[Dict]:
+    """Extrae la mejor detección de balón de un resultado YOLO nativo (compatibilidad)."""
+    candidates = _extract_ball_candidates(ball_result, conf_threshold)
+    return candidates[0] if candidates else None
 
 
 class SoccerAnalysisV5:
@@ -219,6 +198,9 @@ class SoccerAnalysisV5:
         self._cached_field_coverage_ratio: float = 0.0
         self._cached_hull_m2: float = 0.0
 
+        # Auditor y exportador forense de homografía (silencioso sin logs)
+        self.homography_audit = HomographyAuditExporter()
+
 
     def process_frame(
         self,
@@ -250,27 +232,33 @@ class SoccerAnalysisV5:
             player_result = self._last_player_result
 
 
-        # ── 2. Ball Tracker ──────────────────────────────────────────────────
-        raw_ball_det = _extract_ball_detection(ball_result, self.conf_ball)
+        # ── 2. Ball Tracker (Filtro de Kalman + Mahalanobis + Selección Multicandidato) ──
+        # Extraer candidatos por encima de un umbral dinámico permisivo para rescate cinemático
+        ball_candidates = _extract_ball_candidates(ball_result, max(0.12, self.conf_ball * 0.4))
         if is_video:
-            ball_detection, ball_history = self.ball_tracker.update(raw_ball_det)
+            ball_detection, ball_history = self.ball_tracker.update(
+                ball_candidates,
+                H=self.homography_tracker.cached_H,
+            )
         else:
+            raw_ball_det = ball_candidates[0] if ball_candidates else None
             ball_detection = raw_ball_det
             ball_history = [(raw_ball_det["pixel_x"], raw_ball_det["pixel_y"])] if raw_ball_det else []
 
         # ── 3. Homografía (Tracker cinemático temporal + USAC_MAGSAC) ──
+        h_img, w_img = frame_bgr.shape[:2]
         recalc = (frame_idx % self.homography_interval == 0) or (self.homography_tracker.cached_H is None)
         H_cand = None
         cand_residuals = None
         cand_reject_reason = None
         cand_details = None
         status = "HELD_INTERVAL"
+        diag = None
+        trans_meta = {}
 
         if recalc:
-            h_img, w_img = frame_bgr.shape[:2]
             mask_cand = None
             conf_weight = 1.0
-            diag = None
             try:
                 res = compute_homography(
                     kp_result,
@@ -278,6 +266,7 @@ class SoccerAnalysisV5:
                     ransac_threshold=self.ransac_threshold,
                     img_width=w_img,
                     img_height=h_img,
+                    frame_bgr=frame_bgr,
                 )
                 H_cand = res.H
                 mask_cand = res.mask
@@ -341,6 +330,32 @@ class SoccerAnalysisV5:
                 homography_logger.debug(
                     f"[Frame {frame_idx}] ⚠ H {status} (streak={self._h_reject_streak}) — manteniendo previa"
                 )
+        else:
+            H_eff = self._cached_H
+            mask_eff = self._cached_mask
+            trans_meta = {
+                "status": "HELD_INTERVAL",
+                "reject_streak": self.homography_tracker.reject_streak,
+            }
+
+        # Auditoría punto a punto y telemetría de correcciones (exportación silenciosa a JSON)
+        if hasattr(self, "homography_audit") and self.homography_audit is not None:
+            self.homography_audit.record_frame(
+                frame_idx=frame_idx,
+                timestamp_sec=timestamp_sec,
+                kp_result=kp_result,
+                homography_status=status,
+                H_effective=H_eff,
+                H_candidate=H_cand,
+                diagnostics=diag,
+                residuals=cand_residuals,
+                compute_error_reason=cand_reject_reason,
+                compute_error_details=cand_details,
+                transition_metrics=trans_meta,
+                conf_threshold=self.conf_keypoint,
+                img_width=w_img,
+                img_height=h_img,
+            )
 
         H    = self._cached_H
         mask = self._cached_mask
@@ -358,20 +373,24 @@ class SoccerAnalysisV5:
         player_detections: List[Dict] = []
         if should_infer_players:
             if player_result is not None and player_result.boxes is not None and len(player_result.boxes.xyxy) > 0:
-                boxes     = player_result.boxes.xyxy.cpu().numpy()
-                confs     = player_result.boxes.conf.cpu().numpy()
-                classes   = player_result.boxes.cls.cpu().numpy()
-                track_ids = (
-                    player_result.boxes.id.cpu().numpy().astype(int)
-                    if player_result.boxes.id is not None else None
-                )
-                for idx, (box, conf, cls_id) in enumerate(zip(boxes, confs, classes)):
-                    if conf < self.conf_player:
-                        continue
+                # Conversión e indexación vectorizada con supervision
+                sv_dets = sv.Detections.from_ultralytics(player_result)
+                if len(sv_dets) > 0 and sv_dets.confidence is not None:
+                    sv_dets = sv_dets[sv_dets.confidence >= self.conf_player]
+                if len(sv_dets) > 1:
+                    sv_dets = sv_dets.with_nms(
+                        threshold=getattr(settings, "PLAYER_NMS_IOU", 0.45),
+                        class_agnostic=True,
+                    )
+
+                for idx in range(len(sv_dets)):
+                    box = sv_dets.xyxy[idx]
+                    conf = float(sv_dets.confidence[idx]) if sv_dets.confidence is not None else 1.0
+                    cls_id = int(sv_dets.class_id[idx]) if sv_dets.class_id is not None else 0
+                    p_id = int(sv_dets.tracker_id[idx]) if sv_dets.tracker_id is not None else idx
                     x1, y1, x2, y2 = box
                     xc = float((x1 + x2) / 2)
                     yb = float(y2)
-                    p_id = int(track_ids[idx]) if track_ids is not None else idx
                     fx, fy = (pixel_to_field(xc, yb, H) if H is not None else (None, None))
 
                     # Actualizar velocidad para interpolación cinemática (Fase 2)
@@ -384,8 +403,8 @@ class SoccerAnalysisV5:
 
                     player_detections.append({
                         "player_id":   p_id,
-                        "class_id":    int(cls_id),
-                        "confidence":  float(conf),
+                        "class_id":    cls_id,
+                        "confidence":  round(float(conf), 4),
                         "bbox":        [round(float(x1), 2), round(float(y1), 2), round(float(x2), 2), round(float(y2), 2)],
                         "pixel_x":     round(xc, 2),
                         "pixel_y":     round(yb, 2),
@@ -393,12 +412,6 @@ class SoccerAnalysisV5:
                         "pitch_y_m":   round(fy, 2) if fy is not None else None,
                         "is_interpolated": False,
                     })
-
-            # Deduplicación intra-frame para eliminar tracks gemelos/solapados en el mismo frame
-            player_detections = _deduplicate_player_detections(
-                player_detections,
-                iou_thresh=getattr(settings, "PLAYER_NMS_IOU", 0.45)
-            )
 
             # Clasificación de camisetas y equipos (Fases 1 y 2)
             self.team_detector.annotate_player_detections(frame_bgr, player_detections, frame_idx=frame_idx)
@@ -506,11 +519,14 @@ class SoccerAnalysisV5:
         output_path: str,
         csv_output_path: Optional[str] = None,
         json_output_path: Optional[str] = None,
+        parquet_output_path: Optional[str] = None,
+        mot_output_path: Optional[str] = None,
         max_frames: Optional[int] = None,
         headless: Optional[bool] = None,
         debug_homography: bool = False,
         rejections_csv_path: Optional[str] = None,
         keypoints_csv_path: Optional[str] = None,
+        homography_json_path: Optional[str] = None,
         use_threaded_reader: Optional[bool] = None,
         reader_buffer_size: Optional[int] = None,
     ) -> List[Dict]:
@@ -523,6 +539,10 @@ class SoccerAnalysisV5:
         resolved = settings.resolve_video_source(video_path)
         if not resolved.exists():
             raise FileNotFoundError(f"Video no encontrado: {resolved}")
+
+        # Reiniciar auditor de homografía para este video
+        if hasattr(self, "homography_audit") and self.homography_audit is not None:
+            self.homography_audit.reset()
 
         # Configurar destino de CSV para rechazos de homografía
         actual_rejections_csv = rejections_csv_path or str(settings.OUTPUT_DIR / f"rejections_{resolved.stem}.csv")
@@ -674,6 +694,7 @@ class SoccerAnalysisV5:
         # ── Exportar JSON Contract ───────────────────────────────────────────
         video_name = resolved.name
         duration_sec = round(frame_count / fps, 2) if fps > 0 else 0.0
+        actual_homography_json = homography_json_path or str(settings.OUTPUT_DIR / f"homography_{resolved.stem}.json")
 
         tracking_dataset = {
             "metadata": {
@@ -697,6 +718,7 @@ class SoccerAnalysisV5:
                     "reader_metrics": reader.get_metrics() if hasattr(reader, "get_metrics") else None,
                 },
                 "rejections_csv": actual_rejections_csv,
+                "homography_json": actual_homography_json,
             },
             "frames": tracking_frames,
             "events": [],
@@ -709,6 +731,16 @@ class SoccerAnalysisV5:
         with open(json_path_obj, "w", encoding="utf-8") as f:
             json.dump(tracking_dataset, f, indent=2)
         logger.info(f"💾 Tracking JSON exportado: {actual_json_path}")
+
+        # ── Parquet & MOT Export (Machine Learning / Deep Learning) ───────────
+        actual_parquet_path = parquet_output_path or str(settings.OUTPUT_DIR / f"tracking_{resolved.stem}.parquet")
+        try:
+            from sports.ml_exporter import export_tracking_to_parquet, export_to_mot_challenge
+            export_tracking_to_parquet(tracking_dataset, actual_parquet_path)
+            if mot_output_path:
+                export_to_mot_challenge(tracking_dataset, mot_output_path)
+        except Exception as e:
+            logger.warning(f"[SoccerAnalysisV5] Advertencia al exportar formato ML/Parquet: {e}")
 
         # ── CSV Export ────────────────────────────────────────────────────────
         if csv_output_path and all_events:
@@ -754,6 +786,8 @@ class SoccerAnalysisV5:
         logger.info(f"   Total video write: {total_video_time:.2f}s  ({_pct(total_video_time)} del total)")
         logger.info("-" * 65)
         logger.info(f"   JSON Output:       {actual_json_path}")
+        logger.info(f"   Homography JSON:   {actual_homography_json}")
+        logger.info(f"   Parquet ML Output: {actual_parquet_path}")
         if not is_headless:
             logger.info(f"   MP4 Output:        {output_path}")
         logger.info("=" * 65)
@@ -763,6 +797,22 @@ class SoccerAnalysisV5:
         logger.info("\n" + rejection_summary)
         saved_rejections_csv = self.homography_tracker.save_rejections_to_csv(actual_rejections_csv)
         logger.info(f"📄 CSV de rechazos exportado: {saved_rejections_csv}")
+
+        # ── Exportar Homography JSON (Detecciones, Puntos Correctos/Fallidos y Correcciones) ──
+        audit_metadata = {
+            "video_name": video_name,
+            "fps": round(fps, 2),
+            "total_frames": frame_count,
+            "duration_seconds": duration_sec,
+            "homography_interval": self.homography_interval,
+            "rejections_csv": actual_rejections_csv,
+        }
+        saved_homography_json = self.homography_audit.save_to_json(actual_homography_json, metadata=audit_metadata)
+        logger.info(f"📐 Homografía JSON exportado: {saved_homography_json}")
+
+        if keypoints_csv_path:
+            saved_keypoints_csv = self.homography_audit.save_to_csv(keypoints_csv_path)
+            logger.info(f"📊 CSV de keypoints exportado: {saved_keypoints_csv}")
 
         logger.info("=" * 65)
 
@@ -778,8 +828,11 @@ def main():
     parser.add_argument("--output", "-o", default=settings.DEFAULT_OUTPUT_VIDEO, help="Video de salida MP4")
     parser.add_argument("--csv",    "-c", default=settings.DEFAULT_OUTPUT_CSV,   help="CSV de eventos")
     parser.add_argument("--json",   "-j", default=None,                          help="JSON de tracking output")
+    parser.add_argument("--parquet", "-p", default=None,                         help="Parquet de tracking output (ML/DL)")
+    parser.add_argument("--mot",          default=None,                          help="MOTChallenge format output")
     parser.add_argument("--rejections-csv", default=None,                        help="CSV para exportar rechazos de homografía")
     parser.add_argument("--keypoints-csv",  default=None,                        help="CSV para exportar auditoría forense de keypoints")
+    parser.add_argument("--homography-json", default=None,                        help="JSON para exportar auditoría de homografía (detecciones, puntos correctos, fallidos y correcciones)")
     parser.add_argument("--env",    "-e", choices=["LOCAL", "KAGGLE", "COLAB"],           help="Forzar entorno (LOCAL, KAGGLE, COLAB)")
     parser.add_argument("--headless", action="store_true", default=None,         help="Modo headless (Sin renderizar MP4/Overlays)")
     parser.add_argument("--max-frames", "-m", type=int, default=None,            help="Límite de frames")
@@ -854,11 +907,14 @@ def main():
             output_path=args.output,
             csv_output_path=args.csv,
             json_output_path=args.json,
+            parquet_output_path=args.parquet,
+            mot_output_path=args.mot,
             max_frames=args.max_frames,
             headless=args.headless,
             debug_homography=args.debug_homography,
             rejections_csv_path=args.rejections_csv,
             keypoints_csv_path=args.keypoints_csv,
+            homography_json_path=args.homography_json,
             use_threaded_reader=not args.disable_threaded_reader,
             reader_buffer_size=args.reader_buffer,
         )
