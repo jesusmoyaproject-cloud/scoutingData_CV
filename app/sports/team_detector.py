@@ -40,7 +40,7 @@ class TeamDetector:
         history_window: int = 35,
         lock_threshold: int = 12,
         sample_interval: int = 5,
-        outlier_distance_lab: float = 28.0,
+        outlier_distance_lab: float = 38.0,
         pitch_length: float = 105.0,
         pitch_width: float = 68.0,
     ):
@@ -170,6 +170,12 @@ class TeamDetector:
         c0 = np.mean(samples[labels.flatten() == 0], axis=0) if np.any(labels == 0) else centers_feat[0]
         c1 = np.mean(samples[labels.flatten() == 1], axis=0) if np.any(labels == 1) else centers_feat[1]
 
+        # Verificar separación cromática real entre centroides (canales a*, b*)
+        chroma_sep = float(np.linalg.norm(c0[1:] - c1[1:]))
+        if chroma_sep < 12.0 and len(self._calibration_samples) < 60:
+            # Ambos centroides corresponden al mismo equipo (ej. en saque inicial), seguir recolectando
+            return
+
         self.centroids_lab = np.array([c0, c1], dtype=np.float32)
 
         # Derivar colores RGB/BGR representativos para cada equipo
@@ -196,12 +202,12 @@ class TeamDetector:
         Aplica consistencia temporal y bloqueo por track_id.
         """
         # Si aún estamos recolectando muestras, registrar para calibración
-        if not self._is_calibrated:
+        if not self._is_calibrated or len(self._calibration_samples) < 40:
             self._calibration_samples.append(lab_color)
             if len(self._calibration_samples) >= self.min_samples_to_cluster:
                 self._calibrate_centroids()
 
-        # Si aún no tenemos centroides K-Means calibrados, emitir clasificación provisional
+        # Si aún no tenemos centroides K-Means calibrados, emitir clasificación provisional con color real
         if self.centroids_lab is None:
             team_id = 0
             role = "player"
@@ -255,9 +261,18 @@ class TeamDetector:
                     role = "referee"
                     assigned_team = -1
             else:
-                # Sin homografía, si es outlier cromático fuerte considerarlo árbitro
-                role = "referee"
-                assigned_team = -1
+                # Sin homografía: SOLO clasificar como árbitro si el color es realmente oscuro/negro acromático o flúor
+                # Un color cromático (celeste, rojo, azul, verde) NUNCA debe clasificarse como árbitro negro
+                chroma_dist = float(np.hypot(lab_color[1] - 128.0, lab_color[2] - 128.0))
+                is_dark_referee = (lab_color[0] <= 85.0) and (chroma_dist <= 16.0)
+                is_neon_referee = (lab_color[0] >= 170.0) and (lab_color[1] <= 115) and (lab_color[2] >= 150)
+
+                if is_dark_referee or is_neon_referee:
+                    role = "referee"
+                    assigned_team = -1
+                else:
+                    role = "player"
+                    assigned_team = raw_team
 
         # Consistencia Temporal Dinámica (Smoothing ponderado por track_id)
         if track_id is not None:

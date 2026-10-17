@@ -198,8 +198,29 @@ def draw_calibration_overlay(
     badge_h = 32
     h_img, w_img = img.shape[:2]
 
-    # ── Badge de Cobertura de Terreno (Field Coverage Ratio) ─────────────
-    if field_coverage_ratio is not None and field_coverage_ratio > 0:
+    # ── Badge 1: Estado de Homografía (H: VALID / H: LOST) ─────────────────
+    h_is_valid = (H is not None)
+    h_status_str = "H: VALID" if h_is_valid else "H: LOST"
+    (htw, hth), _ = cv2.getTextSize(h_status_str, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+    hbx, hby = badge_x, badge_y
+    hbw, hbh = htw + 32, badge_h
+
+    if hby + hbh < h_img and hbx + hbw < w_img:
+        sub = img[hby:hby+hbh, hbx:hbx+hbw]
+        bg = np.zeros_like(sub)
+        cv2.addWeighted(bg, 0.65, sub, 0.35, 0, sub)
+        img[hby:hby+hbh, hbx:hbx+hbw] = sub
+
+        h_dot = (0, 255, 128) if h_is_valid else (0, 0, 255)
+        h_border = (0, 180, 80) if h_is_valid else (0, 0, 220)
+        cv2.rectangle(img, (hbx, hby), (hbx+hbw, hby+hbh), h_border, 1, cv2.LINE_AA)
+        cv2.circle(img, (hbx + 12, hby + hbh//2), 4, h_dot, -1, cv2.LINE_AA)
+        cv2.putText(img, h_status_str, (hbx + 22, hby + hbh - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+        badge_x = hbx + hbw + 10
+
+    # ── Badge 2: Cobertura de Terreno (Field Coverage Ratio) ─────────────
+    if field_coverage_ratio is not None and field_coverage_ratio > 0 and h_is_valid:
         pct_val = field_coverage_ratio * 100.0
         pct_str = f"Field Coverage: {pct_val:.1f}%"
         if hull_area_m2 is not None and hull_area_m2 > 0:
@@ -223,7 +244,7 @@ def draw_calibration_overlay(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
             badge_x = bx + bw + 10
 
-    # ── Badge de Número de Frame (al costado de Field Coverage en LOCAL) ──
+    # ── Badge 3: Número de Frame (al costado de badges de estado) ─────────
     if frame_idx is not None:
         frame_str = f"Frame: {frame_idx}"
         (ftw, fth), _ = cv2.getTextSize(frame_str, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
@@ -282,7 +303,7 @@ def draw_calibration_overlay(
         is_inlier = True
         if mask is not None and used < len(mask):
             is_inlier = bool(mask[used][0])
-        elif mask is not None:
+        elif mask is not None or H is None:
             is_inlier = False
 
         if not is_inlier and not draw_outliers and not draw_residuals:

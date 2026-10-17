@@ -22,7 +22,6 @@ if str(APP_DIR) not in sys.path:
 
 # Asegurar entorno COLAB
 os.environ["ENVIRONMENT"] = "COLAB"
-os.environ["HEADLESS_MODE"] = "True"
 
 import warnings
 warnings.filterwarnings("ignore", message=".*'half' is deprecated.*")
@@ -101,7 +100,7 @@ def run_pipeline(
     parquet_path: str = None,
     mot_path: str = None,
     max_frames: int = None,
-    headless: bool = True,
+    headless: bool = False,
     homography_interval: int = 1,
     player_stride: int = settings.PLAYER_INFERENCE_STRIDE,
     debug_homography: bool = False,
@@ -138,6 +137,7 @@ def run_pipeline(
         homography_interval=homography_interval,
         player_stride=player_stride,
         headless=headless,
+        show_frame_number=True,
     )
 
     pipeline.process_video(
@@ -155,9 +155,12 @@ def run_pipeline(
 
     logger.info("=" * 68)
     logger.info(f"🎉 Proceso completado exitosamente en Google Colab.")
+    if not headless:
+        logger.info(f"   🎬 Video MP4:        {actual_output}")
     logger.info(f"   📄 Tracking JSON:    {actual_json}")
     logger.info(f"   📐 Homografía JSON:  {actual_homography_json}")
     logger.info(f"   📊 Tracking Parquet: {actual_parquet}")
+    logger.info(f"   📋 Eventos CSV:      {actual_csv}")
     logger.info("=" * 68)
     return True
 
@@ -165,15 +168,16 @@ def run_pipeline(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Google Colab L4 GPU Runner — ScoutingData v5.0")
     parser.add_argument("--video",  "-v", default=settings.DEFAULT_INPUT_VIDEO, help="Ruta del video (ej: /content/partido.mp4)")
-    parser.add_argument("--output", "-o", default=None, help="Ruta de video de salida (si no es headless)")
+    parser.add_argument("--output", "-o", default=None, help="Ruta de video de salida MP4 (default: outputs/scouting_output.mp4)")
     parser.add_argument("--csv",    "-c", default=None, help="Ruta del CSV de eventos")
     parser.add_argument("--json",   "-j", default=None, help="Ruta del JSON de tracking")
     parser.add_argument("--parquet", "-p", default=None, help="Ruta del Parquet de tracking (ML/DL)")
     parser.add_argument("--mot",          default=None, help="Ruta del archivo MOTChallenge (.mot)")
     parser.add_argument("--homography-json", default=None, help="Ruta para exportar auditoría JSON de homografía")
     parser.add_argument("--max-frames", "-m", type=int, default=None, help="Límite de frames a procesar")
-    parser.add_argument("--headless", action="store_true", default=True, help="Modo headless (alta velocidad, sin renderizar video)")
-    parser.add_argument("--with-video", dest="headless", action="store_false", help="Generar también el video MP4 renderizado")
+    parser.add_argument("--headless", action="store_true", default=False, help="Modo headless (solo datos, sin renderizar video MP4)")
+    parser.add_argument("--with-video", dest="headless", action="store_false", help="Forzar generación de video MP4 renderizado (activo por defecto)")
+    parser.add_argument("--no-video", dest="headless", action="store_true", help="Omitir generación de video MP4 para máxima velocidad")
     parser.add_argument("--homography-interval", type=int, default=1, help="Intervalo de cálculo de homografía (1=cada frame, 2=cada 2 frames)")
     parser.add_argument("--player-stride", type=int, default=settings.PLAYER_INFERENCE_STRIDE, help="Stride de inferencia de jugadores (1=todos, 2=interpolar alternados)")
     parser.add_argument("--debug", action="store_true", default=False, help="Modo debug de homografía")

@@ -55,8 +55,12 @@ def run_test(video_path: str, max_frames: int, debug: bool, interval: int, headl
         _enable_debug_mode()
 
     video_stem = Path(video_path).stem
-    json_out   = str(TEST_OUTPUT_DIR / f"test_{video_stem}_{max_frames}f.json")
-    video_out  = str(TEST_OUTPUT_DIR / f"test_{video_stem}_{max_frames}f.mp4")
+    json_out       = str(TEST_OUTPUT_DIR / f"test_{video_stem}_{max_frames}f.json")
+    video_out      = str(TEST_OUTPUT_DIR / f"test_{video_stem}_{max_frames}f.mp4")
+    events_csv     = str(TEST_OUTPUT_DIR / f"events_test_{video_stem}_{max_frames}f.csv")
+    rejections_csv = str(TEST_OUTPUT_DIR / f"rejections_test_{video_stem}_{max_frames}f.csv")
+    keypoints_csv  = str(TEST_OUTPUT_DIR / f"keypoints_audit_test_{video_stem}_{max_frames}f.csv")
+    homography_json = str(TEST_OUTPUT_DIR / f"homography_test_{video_stem}_{max_frames}f.json")
 
     pipeline = SoccerAnalysisV5(
         homography_interval=interval,
@@ -67,19 +71,26 @@ def run_test(video_path: str, max_frames: int, debug: bool, interval: int, headl
     pipeline.process_video(
         video_path=video_path,
         output_path=video_out,
-        csv_output_path=None,
+        csv_output_path=events_csv,
         json_output_path=json_out,
         max_frames=max_frames,
         headless=headless,
         debug_homography=debug,
+        rejections_csv_path=rejections_csv,
+        keypoints_csv_path=keypoints_csv,
+        homography_json_path=homography_json,
     )
     elapsed = time.time() - t_start
 
     logger.info("=" * 65)
     logger.info(f"  ✅ Test completado en {elapsed:.1f}s")
-    logger.info(f"  📄 JSON:  {json_out}")
+    logger.info(f"  📄 Tracking JSON:       {json_out}")
+    logger.info(f"  📊 CSV Auditoría KPs:   {keypoints_csv}")
+    logger.info(f"  📐 Homografía JSON:     {homography_json}")
+    logger.info(f"  📉 Rechazos CSV:        {rejections_csv}")
+    logger.info(f"  📋 Eventos CSV:         {events_csv}")
     if not headless:
-        logger.info(f"  🎬 Video: {video_out}")
+        logger.info(f"  🎬 Video con Overlays:  {video_out}")
     logger.info("=" * 65)
 
 
@@ -95,7 +106,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--frames", "-f",
         type=int,
-        default=1000,
+        default=3000,
         help="Número máximo de frames (default: 1000)"
     )
     parser.add_argument(

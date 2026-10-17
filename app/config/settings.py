@@ -42,7 +42,7 @@ def detect_headless_mode() -> bool:
     env_val = os.getenv("HEADLESS_MODE")
     if env_val is not None:
         return env_val.lower() in ("true", "1", "yes")
-    return ENVIRONMENT in ("KAGGLE", "COLAB")
+    return False
 
 HEADLESS_MODE = detect_headless_mode()
 
@@ -214,7 +214,7 @@ TRACKER_TYPE            = os.getenv("TRACKER_TYPE", "botsort")
 PLAYER_INFERENCE_STRIDE = int(os.getenv("PLAYER_INFERENCE_STRIDE", "1"))  # 1=todos los frames, 2=skip adaptativo
 PLAYER_NMS_IOU          = float(os.getenv("PLAYER_NMS_IOU", "0.45"))      # NMS IoU para evitar doble track en mismo jugador
 ENABLE_TEAM_CLASSIFIER  = os.getenv("ENABLE_TEAM_CLASSIFIER", "true").lower() in ("true", "1", "yes")
-SHOW_FRAME_NUMBER       = os.getenv("SHOW_FRAME_NUMBER", "true" if ENVIRONMENT == "LOCAL" else "false").lower() in ("true", "1", "yes")
+SHOW_FRAME_NUMBER       = os.getenv("SHOW_FRAME_NUMBER", "true").lower() in ("true", "1", "yes")
 
 
 

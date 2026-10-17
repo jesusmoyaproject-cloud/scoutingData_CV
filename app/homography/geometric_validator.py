@@ -177,14 +177,21 @@ def filter_border_keypoints(
             logger.debug(f"Keypoint descartado por borde de imagen: {lbl} en ({x:.1f}, {y:.1f})")
             continue
 
-        if frame_bgr is not None:
+        # 2. Verificar presencia de césped solo en zonas periféricas/vallas publicitarias.
+        # Un keypoint dentro del campo no puede ser un banner comercial y no debe descartarse
+        # por variaciones de iluminación o césped desaturado en estadios nublados.
+        top_banner_limit = float(img_height) * 0.22
+        is_peripheral = (y <= top_banner_limit) or (x <= (img_width * 0.05)) or (x >= (img_width * 0.95))
+
+        if frame_bgr is not None and is_peripheral:
             ix, iy = int(round(x)), int(round(y))
             y0, y1 = max(0, iy - patch_radius), min(img_height, iy + patch_radius)
             x0, x1 = max(0, ix - patch_radius), min(img_width, ix + patch_radius)
             patch = frame_bgr[y0:y1, x0:x1]
             if patch.size > 0:
                 hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-                grass_mask = cv2.inRange(hsv_patch, (28, 30, 30), (95, 255, 255))
+                # Rango ampliado de césped deportivo: H [22, 105], S [10, 255] (soporta césped desaturado/nublado), V [25, 255]
+                grass_mask = cv2.inRange(hsv_patch, (22, 10, 25), (105, 255, 255))
                 grass_ratio = float(np.count_nonzero(grass_mask)) / float(grass_mask.size)
                 if grass_ratio < min_grass_ratio:
                     logger.debug(

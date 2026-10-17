@@ -465,19 +465,18 @@ class SoccerAnalysisV5:
                 draw_residuals=self.draw_outliers,
                 frame_idx=display_frame_idx,
             )
-        elif display_frame_idx is not None:
-            # Si H todavía no está disponible pero estamos en LOCAL, dibujar badge de frame
+        else:
+            # Si H no está disponible, dibujar overlay con status H: LOST y mostrar keypoints candidatos detectados
             draw_calibration_overlay(
                 annotated, kp_result, mask=mask,
                 conf_threshold=self.conf_keypoint,
-                draw_outliers=self.draw_outliers,
-                field_coverage_ratio=self._cached_field_coverage_ratio,
-                hull_area_m2=self._cached_hull_m2,
+                draw_outliers=True,
+                field_coverage_ratio=0.0,
+                hull_area_m2=0.0,
                 H=None,
                 draw_residuals=False,
                 frame_idx=display_frame_idx,
             )
-
 
         draw_player_detections(annotated, player_result,
                                player_detections=player_detections,
@@ -511,6 +510,20 @@ class SoccerAnalysisV5:
 
         else:
             minimap = self._minimap_template.copy()
+            # Overlay visual de pérdida de homografía en el minimap
+            h_m, w_m = minimap.shape[:2]
+            banner_text = "HOMOGRAPHY LOST / SEARCHING"
+            (bw, bh), _ = cv2.getTextSize(banner_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            bx = max(10, (w_m - bw) // 2)
+            by = h_m // 2
+            sub = minimap[by - bh - 10 : by + 16, bx - 12 : bx + bw + 12]
+            if sub.shape[0] > 0 and sub.shape[1] > 0:
+                bg = np.zeros_like(sub)
+                bg[:] = (0, 0, 110)
+                cv2.addWeighted(bg, 0.70, sub, 0.30, 0, sub)
+                minimap[by - bh - 10 : by + 16, bx - 12 : bx + bw + 12] = sub
+                cv2.rectangle(minimap, (bx - 12, by - bh - 10), (bx + bw + 12, by + 16), (0, 0, 230), 2, cv2.LINE_AA)
+                cv2.putText(minimap, banner_text, (bx, by + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
 
         minimap_rgb = cv2.cvtColor(minimap, cv2.COLOR_BGR2RGB)
 
@@ -837,7 +850,9 @@ def main():
     parser.add_argument("--keypoints-csv",  default=None,                        help="CSV para exportar auditoría forense de keypoints")
     parser.add_argument("--homography-json", default=None,                        help="JSON para exportar auditoría de homografía (detecciones, puntos correctos, fallidos y correcciones)")
     parser.add_argument("--env",    "-e", choices=["LOCAL", "KAGGLE", "COLAB"],           help="Forzar entorno (LOCAL, KAGGLE, COLAB)")
-    parser.add_argument("--headless", action="store_true", default=None,         help="Modo headless (Sin renderizar MP4/Overlays)")
+    parser.add_argument("--headless", action="store_true", default=False,        help="Modo headless (Sin renderizar MP4/Overlays)")
+    parser.add_argument("--with-video", dest="headless", action="store_false",   help="Forzar renderizado de video MP4 (activo por defecto)")
+    parser.add_argument("--no-video", dest="headless", action="store_true",      help="Omitir renderizado de video MP4 para máxima velocidad")
     parser.add_argument("--max-frames", "-m", type=int, default=None,            help="Límite de frames")
     parser.add_argument("--homography-interval", type=int,
                         default=settings.HOMOGRAPHY_INTERVAL,
@@ -881,6 +896,9 @@ def main():
     if args.headless:
         os.environ["HEADLESS_MODE"] = "True"
         settings.HEADLESS_MODE = True
+    else:
+        os.environ["HEADLESS_MODE"] = "False"
+        settings.HEADLESS_MODE = False
 
     show_frame = False if args.hide_frame_num else (True if args.show_frame_num else None)
 
